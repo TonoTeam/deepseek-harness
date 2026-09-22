@@ -9,6 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { resolve } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import { admitEncodedImages, type EncodedImageAttachment, type ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, ReasoningEffortId, type ContentBlock, type LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { carrierKeyOf, type Scoped } from '@deepseek-ai/dsh-scope'
@@ -272,18 +273,29 @@ export class HarnessSdkJsonRpcServer {
   }
 
   private async createSession(sessionId: string): Promise<SessionRecord> {
-    // No preset composition: this server's compositions keep the model-facing
-    // rows in the host plane, so this agent reads them from the global layer. A
-    // deployment that configures a roster has to join one here first
-    // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
+    // Join the deployment's default agent preset when a roster is composed,
+    // the way the Web session controller composes a browser session: the
+    // preset's standing mount supplies this agent's tools, prompt sections and
+    // skills, and the preset id is recorded on the session so a replay
+    // rebuilds the same composition. The shipped SDK compositions mount no
+    // roster and keep the model-facing rows in the host plane; there the agent
+    // reads them from the global layer exactly as before.
+    const presets = this.ctx.get('agentPresets')
+    const agentPreset = presets === undefined ? undefined : (await presets.resolve()).id
     const handle = await this.ctx.agents.create({
       sessionId: brandString<SessionId>(sessionId),
-      meta: { cwd: this.cwd },
+      meta: {
+        cwd: this.cwd,
+        ...agentPreset === undefined ? {} : { agentPreset },
+      },
       agentOptions: {
         provider: this.provider,
         model: this.model,
         ...this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort },
         ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+      },
+      ...presets === undefined ? {} : {
+        setup: async (agentCtx: Context) => { await presets.mount(agentCtx, agentPreset) },
       },
     })
     const rec: SessionRecord = { handle }
