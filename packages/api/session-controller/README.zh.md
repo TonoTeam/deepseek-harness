@@ -58,6 +58,11 @@ Session 对象还承载本地提交回显：`session.beginSubmission` 在调用�
 -----
 
 <a id="model-experience"></a>
+## 仅为当前会话选择模型
+
+`selectModelForSession(request)` 解析并验证请求的 provider 和 model，只修改指定 Session 下一次请求的选择，不保存 Host 默认值。它与 `selectModel` 使用相同的 Session 受理串行化和 provider 验证。运行中的请求保持已经组装的模型；其他 Session 及之后创建的 Session 保持自己的选择或 Host 默认值。响应包含规范化的 `selected`；provider 不可用时返回现有模型选择错误。此操作不配置 provider、不保存凭据，也不授予模型使用权限。
+
+
 ## 模型体验
 
 无；任何模型可见效果都由被调用的 Agent 命令负责。

@@ -68,6 +68,7 @@ export interface TestSessionRemote {
   search(request: SessionSearchRequest, signal?: AbortSignal): Promise<RemoteResult<SessionSearchValue>>
   create(request: SessionCreateRequest): Promise<RemoteResult<SessionCreateValue>>
   selectModel(request: SessionSelectModelRequest): Promise<RemoteResult<SessionSelectModelValue>>
+  selectModelForSession(request: SessionSelectModelRequest): Promise<RemoteResult<SessionSelectModelValue>>
   modelCatalog(): Promise<RemoteResult<ModelCatalog>>
   rename(request: SessionRenameRequest): Promise<RemoteResult<SessionRenameValue>>
   fork(request: SessionForkRequest): Promise<RemoteResult<SessionForkValue>>
@@ -342,6 +343,7 @@ export function createSessionTestRemote(
     ),
     create: request => remoteResult(() => direct.create(request)),
     selectModel: request => remoteResult(() => direct.selectModel(request)),
+    selectModelForSession: request => remoteResult(() => direct.selectModelForSession(request)),
     modelCatalog: () => remoteResult(() => direct.modelCatalog()),
     rename: request => remoteResult(() => direct.rename(request)),
     fork: request => remoteResult(() => direct.fork(request)),

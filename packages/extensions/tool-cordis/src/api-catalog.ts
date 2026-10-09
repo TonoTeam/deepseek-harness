@@ -1511,6 +1511,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the normalized selection installed for the Session.',
       },
       {
+        signature: '@Remote(\'selectModelForSession\') selectModelForSession(request: SessionSelectModelRequest): Promise<SessionSelectModelValue>',
+        description: 'Select only this Session\'s model without changing the Host default.',
+        parameters: [{ name: 'request', description: 'Session identity and requested provider/model selection.' }],
+        returns: 'the normalized selection applied for the Session\'s next request.',
+      },
+      {
         signature: '@Remote(\'modelCatalog\') modelCatalog(): Promise<ModelCatalog>',
         description: 'Describe every currently routable model for Host-generation selectors.',
         parameters: [],

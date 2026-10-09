@@ -58,6 +58,11 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 -----
 
 <a id="model-experience"></a>
+## Session-only model selection
+
+`selectModelForSession(request)` resolves and validates the requested provider and model, then applies the selection to the identified Session's next request without saving a Host default. It uses the same Session admission serialization and provider validation as `selectModel`. A running request retains its assembled model. Other Sessions and subsequently created Sessions retain their own or the Host's default selection. The response contains the normalized `selected` value; unavailable providers return the existing model-selection errors. This operation does not configure provider profiles, store credentials, or authorize model use.
+
+
 ## Model Experience
 
 None, as invoked Agent commands own any model-visible effect.

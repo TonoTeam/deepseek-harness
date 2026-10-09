@@ -804,6 +804,13 @@ inspect( sessionId: SessionId, signal?: AbortSignal, ): Promise<SessionInspectio
 @Remote('selectModel') selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue>
 
 /**
+ * Select only this Session's model without changing the Host default.
+ * @param request - Session identity and requested provider/model selection.
+ * @returns the normalized selection applied for the Session's next request.
+ */
+@Remote('selectModelForSession') selectModelForSession(request: SessionSelectModelRequest): Promise<SessionSelectModelValue>
+
+/**
  * Describe every currently routable model for Host-generation selectors.
  * @returns provider-grouped models, the deployment default, and isolated provider failures.
  */

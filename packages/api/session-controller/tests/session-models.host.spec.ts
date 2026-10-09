@@ -428,6 +428,22 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
+  it('selects a Session model without saving the Host default', async () => {
+    const { ctx, sessionId } = await harness()
+    const save = vi.fn()
+    const remote = createSessionTestRemote(ctx, {
+      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+      saveDefaultModelSelection: save, cwd: '/tmp',
+    })
+    expect(expectValue(await remote.selectModelForSession(request({
+      sessionId, provider: 'deepseek-official', model: 'deepseek-reasoner',
+    }))).selected.model).toBe('deepseek-reasoner')
+    expect(save).not.toHaveBeenCalled()
+    expect(ctx.agentDefaultModel.currentSelection()).toMatchObject({ model: 'deepseek-chat' })
+    expect(currentSelection(ctx, sessionId)).toMatchObject({ model: 'deepseek-reasoner' })
+    await ctx.fiber.dispose()
+  })
+
   it('accepts an advisory-unlisted model, rejects an unavailable provider, and switches only after the next assembly', async () => {
     const { ctx, agent, sessionId } = await harness()
     const remote = createSessionTestRemote(ctx, { defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }), cwd: '/tmp' })
