@@ -239,3 +239,5 @@ Program-only SDK bindings:
 无。
 
 </details>
+
+工具定义可通过 `finalizeMeta` 保留与执行绑定的 JSON 元数据，覆盖成功、失败及嵌套调用。运行时在派发时捕获回调、对返回值保存快照，并在通知结果观察者前提交；返回 undefined 时保留已有元数据。

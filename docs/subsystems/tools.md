@@ -6,6 +6,8 @@ The tool pipeline of [dsh-tools](../../packages/core/tools). [core.md](core.md) 
 
 Source: [`packages/core/tools/src/index.ts`](../../packages/core/tools/src/index.ts) · [`packages/core/tools/src/schema.ts`](../../packages/core/tools/src/schema.ts) · [`packages/core/tools/src/presentation.ts`](../../packages/core/tools/src/presentation.ts)
 
+`finalizeMeta` is the definition-owned metadata counterpart of `finalizeContent`: it receives the immutable finalized success or failure, including nested calls, and returns snapshotted JSON metadata before `tools/result`. Undefined preserves existing metadata. Provider receipts remain separate from model-visible content.
+
 ## `ToolDefinition` — a registered tool
 
 A `ToolSchema` (the model-facing fields) plus a mandatory canonical output declaration, the `execute` function, host-only scheduler metadata, an optional final-content callback, and optional UI presenters. The registry holds these; the loop dispatches calls through them. The registry's `schemas()` builds the model-facing `ToolSchema[]` by an explicit allowlist — `output`/`execute`/`finalizeContent`/`timeoutMs`/`isConcurrencySafe`/`presentCall`/`presentResult` must never leak into a model request.
@@ -50,6 +52,13 @@ interface ToolDefinition extends ToolSchema {
    * @returns replacement content, or `undefined` to preserve it.
    */
   finalizeContent?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): ContentBlock[] | undefined
+  /**
+   * Optional definition-owned metadata for the final success or failure, including nested calls.
+   * Captured when dispatch starts and snapshotted before durable result notification.
+   * Returning undefined preserves existing metadata; a JSON value replaces it.
+   * The callback receives immutable execution/result views and must be synchronous and side-effect-free.
+   */
+  finalizeMeta?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): JsonValue | undefined
   /**
    * Cooperative tool-call timeout budget in milliseconds. Omit for no deadline.
    * Enforced by `@deepseek-ai/dsh-tool-call-timeout-policy` (a `tools/execute` wrapper); it

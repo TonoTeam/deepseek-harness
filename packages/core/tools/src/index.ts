@@ -240,6 +240,13 @@ export interface ToolDefinition extends ToolSchema {
    */
   finalizeContent?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): ContentBlock[] | undefined
   /**
+   * Optional definition-owned metadata for the final success or failure, including nested calls.
+   * Captured when dispatch starts and snapshotted before durable result notification.
+   * Returning undefined preserves existing metadata; a JSON value replaces it.
+   * The callback receives immutable execution/result views and must be synchronous and side-effect-free.
+   */
+  finalizeMeta?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): JsonValue | undefined
+  /**
    * Cooperative tool-call timeout budget in milliseconds. Omit for no deadline.
    * Enforced by `@deepseek-ai/dsh-tool-call-timeout-policy` (a `tools/execute` wrapper); it
    * is NEVER sent to the model — `schemas()` whitelists only name/description/
@@ -521,12 +528,12 @@ export class ToolOutputError extends HarnessError {
 }
 
 /** Convert one projector exception into the canonical invalid-output failure. */
-function projectionError(toolName: string, projector: 'render' | 'presentationMeta', error: unknown): ToolOutputError {
+function projectionError(toolName: string, projector: 'render' | 'presentationMeta' | 'finalizeMeta', error: unknown): ToolOutputError {
   return new ToolOutputError(toolName, [`output.${projector} failed: ${errorMessage(error)}`])
 }
 
 /** Snapshot one projector result before later durable-result materialization. */
-function snapshotProjection<T>(toolName: string, projector: 'render' | 'presentationMeta', candidate: T): T {
+function snapshotProjection<T>(toolName: string, projector: 'render' | 'presentationMeta' | 'finalizeMeta', candidate: T): T {
   try {
     const detached = snapshotJsonValue(candidate)
     if (detached === undefined) {
@@ -810,6 +817,7 @@ export class ToolRuntime extends Service {
   private cancellationStates = new WeakMap<ToolRunContext, ToolCancellationState>()
   /** Definition-owned final content transform snapshotted before policy begins. */
   private contentFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeContent']>()
+  private metaFinalizers = new WeakMap<ToolRunContext, ToolDefinition['finalizeMeta']>()
   private readonly layers = new ScopedLayers(
     scope => new ToolLayer(scope),
     () => { this.ctx.emit('tools/change') },
@@ -1412,6 +1420,7 @@ export class ToolRuntime extends Service {
     // the same retained path), while the `UNKNOWN_TOOL` denial and the
     // invalid-args failure of a NON-ABORTED collapsed call drop it (the call
     // could never execute).
+    const capturedMetaFinalizer = visible?.finalizeMeta?.bind(visible)
     const capturedFinalizer = visible?.finalizeContent?.bind(visible)
     const finalizerFor = (): ToolDefinition['finalizeContent'] | undefined =>
       collapsed && !signal.aborted ? undefined : capturedFinalizer
@@ -1423,6 +1432,7 @@ export class ToolRuntime extends Service {
       const execution: MutableToolRunContext = { ...base, arguments: deepFreeze(detached) }
       this.deferredContexts.set(execution, deferredContexts)
       this.contentFinalizers.set(execution, finalizerFor())
+      this.metaFinalizers.set(execution, collapsed && !signal.aborted ? undefined : capturedMetaFinalizer)
       this.cancellationStates.set(execution, {
         callerSignal: signal,
         bodyInvoked: false,
@@ -1453,6 +1463,7 @@ export class ToolRuntime extends Service {
     } catch (error: unknown) {
       const execution: MutableToolRunContext = { ...base, arguments: undefined }
       this.contentFinalizers.set(execution, finalizerFor())
+      this.metaFinalizers.set(execution, collapsed && !signal.aborted ? undefined : capturedMetaFinalizer)
       return { kind: 'final-result', exec: execution, result: toolErrorResult(error) }
     }
   }
@@ -1657,9 +1668,13 @@ export class ToolRuntime extends Service {
   /** Apply the snapshotted tool-owned content transform without exposing other result fields. */
   private applyFinalContent(exec: ToolRunContext, result: ToolExecutionResult): ToolExecutionResult {
     const finalizeContent = this.contentFinalizers.get(exec)
-    if (finalizeContent === undefined) return result
-    const content = finalizeContent(exec, result)
-    return content === undefined ? result : { ...result, content }
+    const content = finalizeContent?.(exec, result)
+    const meta = this.metaFinalizers.get(exec)?.(exec, result)
+    return {
+      ...result,
+      ...content === undefined ? {} : { content },
+      ...meta === undefined ? {} : { meta: snapshotProjection(exec.name, 'finalizeMeta', meta) },
+    }
   }
 
   /** Notify observers without exposing a mutation or error channel into the outcome. */
