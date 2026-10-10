@@ -199,6 +199,8 @@ Server instructions contribute text to model requests while their scoped section
 
 Unchanged instructions retain identical prompt text. Updated or removed instructions change the next assembled system message and its reusable prefix.
 
+Validated upstream `_meta` is snapshotted per execution and persisted intact as `tool/result.data.meta.mcp` on success and MCP `isError` failure. It is not inserted into model-facing content or interpreted as instructions. Transport failures without a validated MCP response do not fabricate receipt metadata.
+
 ## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>

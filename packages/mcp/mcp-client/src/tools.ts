@@ -228,12 +228,17 @@ export function createMcpToolDefinition(
 ): ToolDefinition {
   const { name, rawName, description, inputSchema } = options
   const projections = new WeakMap<ToolExecution, PreparedProjection>()
+  const metadata = new WeakMap<ToolExecution, JsonValue>()
   return {
     name,
     description,
     parameters: inputSchema,
     output: createOutput(rawName, supportedOutputSchema(options.outputSchema)),
-    execute: createExecutor(ctx, options, projections),
+    execute: createExecutor(ctx, options, projections, metadata),
+    finalizeMeta(exec) {
+      const meta = metadata.get(exec)
+      return meta === undefined ? undefined : { mcp: meta }
+    },
     finalizeContent(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) {
       const projection = projections.get(exec)
       if (projection === undefined) return undefined
@@ -273,6 +278,7 @@ function createExecutor(
   ctx: Context,
   options: McpToolDefinitionOptions,
   projections: WeakMap<ToolExecution, PreparedProjection>,
+  metadata: WeakMap<ToolExecution, JsonValue>,
 ): ToolDefinition['execute'] {
   const { rawName, taskRequired } = options
   return async (args: unknown, exec: ToolExecution) => {
@@ -289,6 +295,10 @@ function createExecutor(
       throw new Error(`Tool "${rawName}" returned an invalid MCP result: ${parsed.issues.map(issue => issue.message).join('; ')}`)
     }
     const result = parsed.value
+    if (result._meta !== undefined) {
+      // Receipt metadata belongs to this exact execution, including MCP isError results.
+      metadata.set(exec, structuredClone(result._meta) as JsonValue)
+    }
 
     const content = result.content as unknown as JsonValue[]
     const text = extractText(content, rawName)
