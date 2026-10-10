@@ -6,6 +6,8 @@
 
 源码：[`packages/core/tools/src/index.ts`](../../packages/core/tools/src/index.ts) · [`packages/core/tools/src/schema.ts`](../../packages/core/tools/src/schema.ts) · [`packages/core/tools/src/presentation.ts`](../../packages/core/tools/src/presentation.ts)
 
+`finalizeMeta` 是与 `finalizeContent` 对应、由定义拥有的元数据回调：它接收不可变的最终成功或失败，包括嵌套调用，并在 `tools/result` 前返回需保存快照的 JSON 元数据。undefined 保留已有元数据；提供方回执与模型可见正文分开。
+
 ## `ToolDefinition` — 一个已注册的工具
 
 由一个 `ToolSchema`（面向模型的字段）、必需的规范输出声明、`execute` 函数、仅供宿主使用的调度器元数据、可选的最终内容回调和可选 UI 展示函数组成。注册表持有这些定义，循环通过它们分派调用。注册表的 `schemas()` 通过显式允许列表构建面向模型的 `ToolSchema[]`；`output`/`execute`/`finalizeContent`/`timeoutMs`/`isConcurrencySafe`/`presentCall`/`presentResult` 绝不能泄漏到模型请求中。
@@ -50,6 +52,13 @@ interface ToolDefinition extends ToolSchema {
    * @returns replacement content, or `undefined` to preserve it.
    */
   finalizeContent?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): ContentBlock[] | undefined
+  /**
+   * Optional definition-owned metadata for the final success or failure, including nested calls.
+   * Captured when dispatch starts and snapshotted before durable result notification.
+   * Returning undefined preserves existing metadata; a JSON value replaces it.
+   * The callback receives immutable execution/result views and must be synchronous and side-effect-free.
+   */
+  finalizeMeta?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): JsonValue | undefined
   /**
    * Cooperative tool-call timeout budget in milliseconds. Omit for no deadline.
    * Enforced by `@deepseek-ai/dsh-tool-call-timeout-policy` (a `tools/execute` wrapper); it

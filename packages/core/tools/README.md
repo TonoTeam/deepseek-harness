@@ -217,6 +217,8 @@ Arguments, results, and additional context are data-dependent and resent until c
 
 Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV Cache entries.
 
+A definition may implement `finalizeMeta` to retain execution-bound JSON metadata on the finalized success or failure, including nested calls. The runtime captures the callback at dispatch, snapshots its value, and commits it before notifying result observers; undefined preserves existing metadata.
+
 ## Known Limitations and Deferred Work
 
 <a id="known-limitations-and-deferred-work"></a>

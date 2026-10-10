@@ -7,6 +7,28 @@ import { describe, expect, it, vi } from 'vitest'
 import { createMcpToolDefinition } from '../src/index.ts'
 
 describe('MCP result callback adaptation', () => {
+  it.each([false, true])('persists complete MCP metadata on success and failure without putting it in model text (%s)', async (isError) => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      const meta = { computer_invocation: { schema_version: 'tono.computer-invocation.v1', call_id: 'gateway-call', status: isError ? 'error' : 'ok' }, provider: { nested: [1, { label: 'receipt' }] } }
+      let reported: unknown
+      ctx.on('tools/result', (_execution, result) => { reported = result.meta })
+      ctx.tools.register(createMcpToolDefinition(ctx, {
+        name: 'receipt', rawName: 'receipt', description: 'Metadata fixture.', inputSchema: { type: 'object' },
+        call: async () => ({ content: [{ type: 'text', text: 'Fixture output' }], isError, _meta: meta }),
+      }))
+      const result = await ctx.tools.execute({ name: 'receipt', callId: ToolCallId('receipt-call'), arguments: {}, signal: new AbortController().signal })
+      expect(result.isError).toBe(isError)
+      expect(result.meta).toEqual({ mcp: meta })
+      expect(reported).toEqual({ mcp: meta })
+      expect(JSON.stringify(result.content)).not.toContain('gateway-call')
+      meta.provider.nested.push(99)
+      expect(result.meta).not.toEqual({ mcp: meta })
+    } finally { await ctx.fiber.dispose() }
+  })
+
   it('preserves the exact execution, arguments and canonical structured results', async () => {
     const ctx = new Context()
     try {

@@ -522,6 +522,8 @@ export interface DefineToolOptions<S extends ParameterSchemaSpec, O extends Valu
    * @returns replacement content, or `undefined` to preserve it.
    */
   finalizeContent?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): ContentBlock[] | undefined
+  /** Definition-owned finalized metadata; see {@link ToolDefinition.finalizeMeta}. */
+  finalizeMeta?(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): JsonValue | undefined
   /**
    * Pure pending-state presenter.
    * @param args - typed validated arguments.
@@ -550,6 +552,8 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   // Object-literal methods do not use `this`; retaining references is safe.
   // oxlint-disable-next-line typescript/unbound-method
   const userExecute = options.execute
+  // oxlint-disable-next-line typescript/unbound-method
+  const userFinalizeMeta = options.finalizeMeta
   // oxlint-disable-next-line typescript/unbound-method
   const userFinalizeContent = options.finalizeContent
   // oxlint-disable-next-line typescript/unbound-method
@@ -591,6 +595,7 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
       return userExecute(args as InferArgs<S>, exec) as Promise<JsonValue>
     },
   }
+  if (userFinalizeMeta) { tool.finalizeMeta = (exec, result) => userFinalizeMeta(exec, result) }
   if (userFinalizeContent) {
     tool.finalizeContent = (exec, result) => userFinalizeContent(exec, result)
   }
