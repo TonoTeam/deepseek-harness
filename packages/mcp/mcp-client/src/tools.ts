@@ -22,7 +22,26 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { JsonSchemaNode } from '@deepseek-ai/dsh-tools'
-import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { snapshotJsonValue, type JsonValue } from '@deepseek-ai/dsh-util-values'
+
+const resultMetadata = new WeakMap<Context, WeakMap<ToolExecution, JsonValue>>()
+
+/** Capture metadata per execution and project it only into private durable results. */
+function metadataFor(ctx: Context): WeakMap<ToolExecution, JsonValue> {
+  let metadata = resultMetadata.get(ctx)
+  if (metadata !== undefined) return metadata
+  metadata = new WeakMap<ToolExecution, JsonValue>()
+  resultMetadata.set(ctx, metadata)
+  const owned = metadata
+  ctx.on('tools/post-execute', async (exec, _result, next) => {
+    const meta = owned.get(exec)
+    owned.delete(exec)
+    const decision = await next()
+    if (meta === undefined || decision.kind !== 'accept') return decision
+    return { ...decision, meta: { mcp: meta } }
+  }, { global: true })
+  return metadata
+}
 
 /** Resolved options relevant to tool bridging. */
 export interface ToolBridgeOptions {
@@ -228,12 +247,13 @@ export function createMcpToolDefinition(
 ): ToolDefinition {
   const { name, rawName, description, inputSchema } = options
   const projections = new WeakMap<ToolExecution, PreparedProjection>()
+  const metadata = metadataFor(ctx)
   return {
     name,
     description,
     parameters: inputSchema,
     output: createOutput(rawName, supportedOutputSchema(options.outputSchema)),
-    execute: createExecutor(ctx, options, projections),
+    execute: createExecutor(ctx, options, projections, metadata),
     finalizeContent(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) {
       const projection = projections.get(exec)
       if (projection === undefined) return undefined
@@ -273,6 +293,7 @@ function createExecutor(
   ctx: Context,
   options: McpToolDefinitionOptions,
   projections: WeakMap<ToolExecution, PreparedProjection>,
+  metadata: WeakMap<ToolExecution, JsonValue>,
 ): ToolDefinition['execute'] {
   const { rawName, taskRequired } = options
   return async (args: unknown, exec: ToolExecution) => {
@@ -289,6 +310,11 @@ function createExecutor(
       throw new Error(`Tool "${rawName}" returned an invalid MCP result: ${parsed.issues.map(issue => issue.message).join('; ')}`)
     }
     const result = parsed.value
+    if (result._meta !== undefined) {
+      const snapshot = snapshotJsonValue(result._meta)
+      if (snapshot === undefined) throw new Error(`Tool "${rawName}" returned non-JSON MCP metadata`)
+      metadata.set(exec, snapshot as JsonValue)
+    }
 
     const content = result.content as unknown as JsonValue[]
     const text = extractText(content, rawName)

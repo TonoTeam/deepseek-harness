@@ -70,7 +70,7 @@ The [format references](persistence-changes/historical-formats/README.md) cover 
 | `event:tool-workflow/run-end` | event | `42e0916e0dda5f6d1e7bb05d8514717147c036a79c9f36085683469516c1fd3f` | [`event:tool-workflow/run-end`](#persistence-type-eventtool-workflowrun-end) |
 | `event:tool-workflow/run-start` | event | `c1f9e0405de6d18cabb9ee70782a027f9bbdc57e5abec9dcccdd56119e2e9058` | [`event:tool-workflow/run-start`](#persistence-type-eventtool-workflowrun-start) |
 | `event:tool/call` | event | `3b1be838223869fe0a08210db85bf773796ed3f2373ac16555dff227cade0c48` | [`event:tool/call`](#persistence-type-eventtoolcall) |
-| `event:tool/ptc-dispatch` | event | `b33142af8176323ffbb20762541be81c1d51b60a60887803836e0b146e5bef0c` | [`event:tool/ptc-dispatch`](#persistence-type-eventtoolptc-dispatch) |
+| `event:tool/ptc-dispatch` | event | `ca2a0c9a0e4172b1831dbb2747acd6adf620dbe2ea68960220c6279d066e24e6` | [`event:tool/ptc-dispatch`](#persistence-type-eventtoolptc-dispatch) |
 | `event:tool/ptc-dispatch-start` | event | `ec38b5949af8eacaf00df002f4acbe344f934f8a061e9cdc65a52a48e5f6dd93` | [`event:tool/ptc-dispatch-start`](#persistence-type-eventtoolptc-dispatch-start) |
 | `event:tool/result` | event | `29af48b840d0cd9e48b6f50bf3b354f8f6340607c5b99220a48e74f60beac9e2` | [`event:tool/result`](#persistence-type-eventtoolresult) |
 | `event:turn/end` | event | `bab768260853e13a7cf2e22e65af572a1e76a5b2c01f3cdc2ce09d39b87fb70b` | [`event:turn/end`](#persistence-type-eventturnend) |
@@ -1054,7 +1054,7 @@ Source: [`packages/core/session/src/types.ts:341`](../packages/core/session/src/
 'tool/ptc-dispatch': PtcDispatchEventData
 ```
 
-Source: [`packages/core/tools/src/types.ts:58`](../packages/core/tools/src/types.ts)
+Source: [`packages/core/tools/src/types.ts:61`](../packages/core/tools/src/types.ts)
 
 <a id="toolptc-dispatch-start--log-only"></a>
 
@@ -1077,7 +1077,7 @@ Source: [`packages/core/tools/src/types.ts:58`](../packages/core/tools/src/types
 'tool/ptc-dispatch-start': PtcDispatchStartEventData
 ```
 
-Source: [`packages/core/tools/src/types.ts:42`](../packages/core/tools/src/types.ts)
+Source: [`packages/core/tools/src/types.ts:45`](../packages/core/tools/src/types.ts)
 
 <a id="toolresult--surface"></a>
 
@@ -3627,7 +3627,7 @@ Sources: [`packages/core/session/src/types.ts:341`](../packages/core/session/src
 
 ### `event:tool/ptc-dispatch`
 
-SHA-256: `b33142af8176323ffbb20762541be81c1d51b60a60887803836e0b146e5bef0c`
+SHA-256: `ca2a0c9a0e4172b1831dbb2747acd6adf620dbe2ea68960220c6279d066e24e6`
 
 | Property | Presence | Type |
 |---|---|---|
@@ -3657,13 +3657,50 @@ SHA-256: `ec38b5949af8eacaf00df002f4acbe344f934f8a061e9cdc65a52a48e5f6dd93`
 
 SHA-256: `a81059ca06999da1e712414520c2c65e491d052fcf9640fae20aa38f0a5dc735`
 
-Sources: [`packages/core/session/src/types.ts:363`](../packages/core/session/src/types.ts) · [`packages/core/tools/src/types.ts:24`](../packages/core/tools/src/types.ts)
+Sources: [`packages/core/session/src/types.ts:363`](../packages/core/session/src/types.ts) · [`packages/core/tools/src/types.ts:27`](../packages/core/tools/src/types.ts)
 
 | Property | Presence | Type |
 |---|---|---|
 | `code` | required | `string` |
 | `name` | required | `string` |
 | `reason` | optional | `string` |
+
+<a id="persistence-type-eventtoolptc-dispatchdatameta"></a>
+
+### `event:tool/ptc-dispatch.data.meta`
+
+SHA-256: `c592ce75aab73fcab19c1d7845684c72cf402b78d2e1f2833a58ecf9f3598ed6`
+
+Sources: [`packages/util/values/src/index.ts:4`](../packages/util/values/src/index.ts)
+
+One of:
+
+- [`event:tool/ptc-dispatch.data.meta[5]`](#persistence-type-eventtoolptc-dispatchdatameta5)
+- [`event:tool/ptc-dispatch.data.meta[5][0][6]`](#persistence-type-eventtoolptc-dispatchdatameta506)
+- `string`
+- `boolean`
+- `null`
+- `number`
+
+<a id="persistence-type-eventtoolptc-dispatchdatameta5"></a>
+
+### `event:tool/ptc-dispatch.data.meta[5]`
+
+SHA-256: `72ec79127a9c0d0241b1106a74cc2b24c81ce467170f1c3c93f7b71a9496d227`
+
+Array of [`event:tool/ptc-dispatch.data.meta`](#persistence-type-eventtoolptc-dispatchdatameta).
+
+<a id="persistence-type-eventtoolptc-dispatchdatameta506"></a>
+
+### `event:tool/ptc-dispatch.data.meta[5][0][6]`
+
+SHA-256: `529e0ccd0e34079ab4ff21ed87f810cee0388246263bf22e8aba5986b56fae05`
+
+Sources: [`packages/util/values/src/index.ts:4`](../packages/util/values/src/index.ts)
+
+| Property | Presence | Type |
+|---|---|---|
+| [`string`] | index signature | [`event:tool/ptc-dispatch.data.meta`](#persistence-type-eventtoolptc-dispatchdatameta) |
 
 <a id="persistence-type-eventtoolresult"></a>
 
@@ -3693,7 +3730,7 @@ Sources: [`packages/core/session/src/types.ts:355`](../packages/core/session/src
 |---|---|---|
 | `error` | optional | [`event:tool/ptc-dispatch.data.error`](#persistence-type-eventtoolptc-dispatchdataerror) |
 | `message` | required | [`packages/llm/llm/src/message.ts#ToolResultMessage`](#persistence-type-packagesllmllmsrcmessagetstoolresultmessage) |
-| `meta` | optional | [`event:tool/result.data.meta`](#persistence-type-eventtoolresultdatameta) |
+| `meta` | optional | [`event:tool/ptc-dispatch.data.meta`](#persistence-type-eventtoolptc-dispatchdatameta) |
 | `step` | required | `number` |
 | `turn` | required | `number` |
 
@@ -3706,43 +3743,6 @@ SHA-256: `8d6a011f3ef7096a4a922ef420458419ff6b20e1eaeece5d331db7585d2f08d6`
 | Position | Presence | Type |
 |---|---|---|
 | 0 | required | [`packages/llm/llm/src/types.ts#ToolResultBlock`](#persistence-type-packagesllmllmsrctypeststoolresultblock) |
-
-<a id="persistence-type-eventtoolresultdatameta"></a>
-
-### `event:tool/result.data.meta`
-
-SHA-256: `c592ce75aab73fcab19c1d7845684c72cf402b78d2e1f2833a58ecf9f3598ed6`
-
-Sources: [`packages/util/values/src/index.ts:4`](../packages/util/values/src/index.ts)
-
-One of:
-
-- [`event:tool/result.data.meta[5]`](#persistence-type-eventtoolresultdatameta5)
-- [`event:tool/result.data.meta[5][0][6]`](#persistence-type-eventtoolresultdatameta506)
-- `string`
-- `boolean`
-- `null`
-- `number`
-
-<a id="persistence-type-eventtoolresultdatameta5"></a>
-
-### `event:tool/result.data.meta[5]`
-
-SHA-256: `72ec79127a9c0d0241b1106a74cc2b24c81ce467170f1c3c93f7b71a9496d227`
-
-Array of [`event:tool/result.data.meta`](#persistence-type-eventtoolresultdatameta).
-
-<a id="persistence-type-eventtoolresultdatameta506"></a>
-
-### `event:tool/result.data.meta[5][0][6]`
-
-SHA-256: `529e0ccd0e34079ab4ff21ed87f810cee0388246263bf22e8aba5986b56fae05`
-
-Sources: [`packages/util/values/src/index.ts:4`](../packages/util/values/src/index.ts)
-
-| Property | Presence | Type |
-|---|---|---|
-| [`string`] | index signature | [`event:tool/result.data.meta`](#persistence-type-eventtoolresultdatameta) |
 
 <a id="persistence-type-eventturnend"></a>
 
@@ -4639,9 +4639,9 @@ Sources: [`packages/core/tools/src/index.ts:682`](../packages/core/tools/src/ind
 
 ### `packages/core/tools/src/types.ts#PtcDispatchEventData`
 
-SHA-256: `8d2e5a3c4230e6ea6c0b5151f02241d0db02cd2551f2df1b6b9700cddcc0dca3`
+SHA-256: `489953a0fc1e892b0e99d934a4895d17bf0bf334846dbec43323e99b12daa8d8`
 
-Sources: [`packages/core/tools/src/types.ts:20`](../packages/core/tools/src/types.ts)
+Sources: [`packages/core/tools/src/types.ts:21`](../packages/core/tools/src/types.ts)
 
 | Property | Presence | Type |
 |---|---|---|
@@ -4649,6 +4649,7 @@ Sources: [`packages/core/tools/src/types.ts:20`](../packages/core/tools/src/type
 | `content` | required | [`event:agent/inbox/spliced.data.inserted[0].content`](#persistence-type-eventagentinboxspliceddatainserted0content) |
 | `error` | optional | [`event:tool/ptc-dispatch.data.error`](#persistence-type-eventtoolptc-dispatchdataerror) |
 | `isError` | required | `boolean` |
+| `meta` | optional | [`event:tool/ptc-dispatch.data.meta`](#persistence-type-eventtoolptc-dispatchdatameta) |
 | `name` | required | `string` |
 | `parentCallId` | required | `string` |
 | `rootCallId` | required | `string` |
@@ -4660,7 +4661,7 @@ Sources: [`packages/core/tools/src/types.ts:20`](../packages/core/tools/src/type
 
 SHA-256: `2fe5026daf14bd4ff2b7bfb7cf9791c302d9cbba06802178b6dfec00b892698f`
 
-Sources: [`packages/core/tools/src/types.ts:11`](../packages/core/tools/src/types.ts)
+Sources: [`packages/core/tools/src/types.ts:12`](../packages/core/tools/src/types.ts)
 
 | Property | Presence | Type |
 |---|---|---|

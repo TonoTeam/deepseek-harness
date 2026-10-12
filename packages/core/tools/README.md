@@ -131,7 +131,7 @@ New sub-calls use `<parent>:ptc:<n>` ids. Consumers treat these ids as opaque an
 <a id="extension-points"></a>
 ### Extension points
 
-Tool plugins call `ctx.tools.register()` and their schemas flow into prompt assembly automatically. `tools/pre-execute` is the reorderable allow/deny/ask gate; `ctx.tools.guard()` adds monotonic owner policy after it; `tools/execute` wraps normalized canonical dispatch for timeout, retry, or metrics; `tools/post-execute` may replace content or value, block with feedback, or attach ordered contexts; `tools/result` observes the immutable final outcome. MCP servers discover tools and register them with the server's schemas.
+Tool plugins call `ctx.tools.register()` and their schemas flow into prompt assembly automatically. `tools/pre-execute` is the reorderable allow/deny/ask gate; `ctx.tools.guard()` adds monotonic owner policy after it; `tools/execute` wraps normalized canonical dispatch for timeout, retry, or metrics; `tools/post-execute` may replace content or value, block with feedback, attach private metadata, or attach ordered contexts; `tools/result` observes the immutable final outcome. MCP servers discover tools and register them with the server's schemas.
 
 </details>
 
@@ -239,3 +239,5 @@ These limits define when the registry needs special care. They are current packa
 None.
 
 </details>
+
+A `tools/post-execute` accept decision may attach private JSON through `meta`. Native results and PTC sub-dispatch logs preserve it; model messages and program values do not contain it.

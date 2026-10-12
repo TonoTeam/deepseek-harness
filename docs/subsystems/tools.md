@@ -379,7 +379,7 @@ interface ToolErrorInfo {
 }
 ```
 
-The result carries only the outcome. Call identity remains on the immutable `ToolExecution` that accompanies it through every hook and on the durable `tool/call` / `tool/result` session events, so wrappers cannot create a second, disagreeing identity. The canonical `value` is execution-local: the loop persists only `content`, `error`, and `meta`, while `tool/ptc-dispatch` stores the sub-call's rendered `content`, `isError`, and optional structured `error`. Replay reproduces presentation but cannot reconstruct canonical intermediate values. Optional `ToolErrorInfo.reason` retains raw user-facing detail without adding it to model-facing content.
+The result carries only the outcome. Call identity remains on the immutable `ToolExecution` that accompanies it through every hook and on the durable `tool/call` / `tool/result` session events, so wrappers cannot create a second, disagreeing identity. The canonical `value` is execution-local: the loop persists only `content`, `error`, and `meta`, while `tool/ptc-dispatch` stores the sub-call's rendered `content`, `isError`, optional private `meta`, and optional structured `error`. Replay reproduces presentation but cannot reconstruct canonical intermediate values. Optional `ToolErrorInfo.reason` retains raw user-facing detail without adding it to model-facing content.
 
 On success the registry snapshots and validates the body value, freezes it, and invokes the pure renderer plus the optional top-level-call metadata projector. It separately materializes the durable presentation fields immediately before `tools/result`; an invalid value, renderer/projector failure, or non-JSON presentation becomes a JSON-safe `isError`. The final live observer therefore sees the exact execution-local value beside fields safe for the later durable append.
 
@@ -409,8 +409,8 @@ type PreToolDecision =
  * next request, or block by turning corrective feedback into an error result.
  */
 type PostToolDecision =
-  | { kind: 'accept'; content?: ContentBlock[]; value?: never; additionalContexts?: UserMessage[] }
-  | { kind: 'accept'; value: JsonValue; content?: never; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; content?: ContentBlock[]; value?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; value: JsonValue; content?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
   | { kind: 'block'; feedback: ContentBlock[]; additionalContexts?: UserMessage[] }
 ```
 

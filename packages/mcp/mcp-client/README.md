@@ -140,6 +140,8 @@ A tool call uses the SDK with the raw name, complete tool definition, JSON argum
 
 The child environment starts from the subprocess seam's `scrubbedParentEnv()` — ambient names matching `/KEY|PASSWORD|SECRET|TOKEN/i` and ambient `DSH_*` names are dropped — and the configured `env` merges on top, so explicit overrides survive. The MCP SDK owns the actual spawn; this package shares the scrub definition, not the spawn path.
 
+Validated MCP `_meta` is retained unchanged under private result `meta.mcp` for both success and `isError`, including PTC sub-dispatch logs. It is excluded from canonical values, model content and tool schemas, and grants no authorization. Each execution owns its metadata independently; blocked and pre-dispatch-denied outcomes do not acquire MCP references.
+
 </details>
 
 -----

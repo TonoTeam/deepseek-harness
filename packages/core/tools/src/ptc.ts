@@ -588,6 +588,7 @@ export function createRunCodeTool(registry: ToolRuntime, options: RunCodeBridgeO
                 isError: result.isError,
                 ...result.error?.info === undefined ? {} : { error: result.error.info },
                 content: logged,
+                ...result.meta !== undefined ? { meta: result.meta } : {},
               })
             })().finally(() => { logWork.delete(task) })
             logWork.add(task)

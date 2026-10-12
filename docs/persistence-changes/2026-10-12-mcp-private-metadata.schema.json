@@ -1,0 +1,437 @@
+{
+  "formatVersion": 1,
+  "roots": [
+    {
+      "key": "event:tool/ptc-dispatch",
+      "kind": "event",
+      "event": "tool/ptc-dispatch",
+      "surface": false,
+      "digest": "ca2a0c9a0e4172b1831dbb2747acd6adf620dbe2ea68960220c6279d066e24e6",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 21,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 34,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "arguments",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "content",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "error",
+                "type": 29,
+                "optional": true
+              },
+              {
+                "name": "isError",
+                "type": 27,
+                "optional": false
+              },
+              {
+                "name": "meta",
+                "type": 30,
+                "optional": true
+              },
+              {
+                "name": "name",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "parentCallId",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "rootCallId",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "subCallId",
+                "type": 6,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "opaque",
+            "reason": "unknown"
+          },
+          {
+            "kind": "array",
+            "element": 4
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              8,
+              10,
+              12,
+              23,
+              26
+            ]
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "text",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 7,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": "reasoning"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "text",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 9,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "literal",
+            "value": "text"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "arguments",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "id",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "name",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 11,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "literal",
+            "value": "tool-call"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "attachment",
+                "type": 13,
+                "optional": false
+              },
+              {
+                "name": "offloaded",
+                "type": 21,
+                "optional": true
+              },
+              {
+                "name": "type",
+                "type": 22,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "attachmentId",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "bytes",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "height",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "mediaType",
+                "type": 15,
+                "optional": false
+              },
+              {
+                "name": "name",
+                "type": 6,
+                "optional": true
+              },
+              {
+                "name": "originalDimensions",
+                "type": 20,
+                "optional": true
+              },
+              {
+                "name": "width",
+                "type": 14,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "union",
+            "types": [
+              16,
+              17,
+              18,
+              19
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "image/gif"
+          },
+          {
+            "kind": "literal",
+            "value": "image/jpeg"
+          },
+          {
+            "kind": "literal",
+            "value": "image/png"
+          },
+          {
+            "kind": "literal",
+            "value": "image/webp"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "height",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "width",
+                "type": 14,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "image"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "attachment",
+                "type": 24,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 25,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "attachmentId",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "bytes",
+                "type": 14,
+                "optional": false
+              },
+              {
+                "name": "name",
+                "type": 6,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "literal",
+            "value": "file"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "content",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "isError",
+                "type": 27,
+                "optional": true
+              },
+              {
+                "name": "toolCallId",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 28,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "boolean"
+          },
+          {
+            "kind": "literal",
+            "value": "tool-result"
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "code",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "name",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "reason",
+                "type": 6,
+                "optional": true
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              6,
+              14,
+              27,
+              31,
+              32,
+              33
+            ]
+          },
+          {
+            "kind": "array",
+            "element": 30
+          },
+          {
+            "kind": "primitive",
+            "type": "null"
+          },
+          {
+            "kind": "object",
+            "properties": [],
+            "indices": [
+              {
+                "key": 6,
+                "value": 30
+              }
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "tool/ptc-dispatch"
+          }
+        ]
+      }
+    }
+  ],
+  "types": []
+}
