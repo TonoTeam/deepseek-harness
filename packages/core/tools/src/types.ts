@@ -5,6 +5,7 @@
  */
 
 import type { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 
@@ -20,6 +21,8 @@ export interface PtcDispatchStartEventData {
 /** Payload recorded when one nested PTC mode Tool dispatch settles. */
 export interface PtcDispatchEventData extends PtcDispatchStartEventData {
   isError: boolean
+  /** Tool-private metadata, excluded from program values and model messages. */
+  meta?: JsonValue
   content: ContentBlock[]
   /** Replayable tool-owned presentation metadata, separate from model content. */
   meta?: JsonValue

@@ -420,8 +420,8 @@ type PreToolDecision =
  * next request, or block by turning corrective feedback into an error result.
  */
 type PostToolDecision =
-  | { kind: 'accept'; content?: ContentBlock[]; value?: never; additionalContexts?: UserMessage[] }
-  | { kind: 'accept'; value: JsonValue; content?: never; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; content?: ContentBlock[]; value?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; value: JsonValue; content?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
   | { kind: 'block'; feedback: ContentBlock[]; additionalContexts?: UserMessage[] }
 ```
 

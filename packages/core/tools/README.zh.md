@@ -248,3 +248,5 @@ Program-only SDK bindings:
 无。
 
 </details>
+
+`tools/post-execute` 的 accept 决策可通过 `meta` 附加私有 JSON 元数据。Native 结果与 PTC 子调度日志保留该字段；模型消息与程序返回值不包含它。
