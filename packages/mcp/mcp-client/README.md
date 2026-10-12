@@ -60,6 +60,7 @@ Add one entry per server; nothing else is required. After the harness starts, th
 | `url` / `headers` | — | streamable-http: endpoint URL and extra request headers |
 | `toolCallTimeoutMs` | `60,000` | Timeout per `tools/call` or resource request |
 | `maxInstructionBytes` | `32,768` | Maximum UTF-8 bytes of server instructions including attribution; an oversized value rejects the connection |
+| `toolListRefreshMs` | `0` | Tool-list polling interval in milliseconds; zero disables polling |
 | `failOnStartupError` | `false` | Reject plugin activation when the initial connection or tool synchronization fails |
 | `reconnect.enabled` | `true` | Reconnect automatically after a lost connection |
 | `reconnect.initialDelayMs` | `500` | First reconnect delay; doubles per consecutive failed attempt |
@@ -87,6 +88,8 @@ When the model calls an MCP tool, the call runs against the remote server with a
 Images are supported when the current model accepts image input and the harness attachment feature is enabled; they then appear in the conversation like other images. Otherwise — and for audio or embedded resources — the model sees a clear diagnostic message instead of nothing.
 
 ### Startup, updates, and reconnection
+
+Tool-list polling is optional for servers that cannot send change notifications. Set `toolListRefreshMs` to a positive integer; each interval starts after the previous poll settles. Polls and notifications share the synchronization queue and preserve the connection and ongoing tool calls. Failed discovery retains the previous catalog; the remote server remains responsible for checking authorization on every call. Disconnect and disposal stop polling.
 
 The server's tools appear before the harness starts its first turn. When the server changes its tool list, the model's tool set updates automatically; if the update fails, the previous tool set keeps working.
 
