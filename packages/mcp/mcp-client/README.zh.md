@@ -60,6 +60,7 @@ kind: "package-reference"
 | `url` / `headers` | — | streamable-http：端点 URL 与额外请求标头 |
 | `toolCallTimeoutMs` | `60,000` | 每次 `tools/call` 或资源请求的超时 |
 | `maxInstructionBytes` | `32,768` | 包括服务器归属信息在内的服务器指令 UTF-8 字节上限；超出时连接失败 |
+| `toolListRefreshMs` | `0` | 工具目录轮询间隔（毫秒）；零表示关闭 |
 | `failOnStartupError` | `false` | 初始连接或工具同步失败时拒绝插件激活 |
 | `reconnect.enabled` | `true` | 连接丢失后自动重新连接 |
 | `reconnect.initialDelayMs` | `500` | 首次重连延迟；每次连续失败尝试翻倍 |
@@ -87,6 +88,8 @@ kind: "package-reference"
 当前模型接受图片输入且 harness 启用了附件功能时支持图片；图片会像其他图片一样出现在对话中。不支持图片时——以及服务器返回音频或嵌入资源时——模型会看到清晰的诊断消息，而不是什么都没有。
 
 ### 启动、工具更新与重连
+
+对于不能发送变更通知的服务器，可将 `toolListRefreshMs` 设为正整数，启用工具目录轮询；每次间隔从上一次轮询结束后计算。轮询与通知共用同步队列，保留连接和正在执行的工具调用。发现失败时保留原目录；远端服务器仍须在每次调用时检查授权。断线和卸载会停止轮询。
 
 服务器的工具会在 harness 开始首个轮次之前出现。服务器更改工具列表时，模型的工具集会自动更新；更新失败时，上一组工具继续可用。
 
