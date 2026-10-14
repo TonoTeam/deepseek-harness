@@ -436,10 +436,27 @@ export interface SessionWireEvent {
   readonly surfaceOp?: JsonValue
 }
 
+/** Read the current log cut of one resident Session without activating a cold Session. */
+export interface SessionHeadRequest {
+  readonly address: { readonly kind: 'session'; readonly sessionId: SessionId }
+}
+
+/** Process-local resident identity and current inclusive dense log cut; no event bodies. */
+export type SessionHeadValue =
+  | { readonly resident: false }
+  | {
+    readonly resident: true
+    /** Opaque identity of this attached Session instance; changes when the Session object is replaced or the process restarts. */
+    readonly residentId: string
+    readonly header: Pick<SessionWireHeader, 'version' | 'id' | 'createdAt' | 'isSeeded'>
+    /** Current inclusive sequence; -1 for an empty log. */
+    readonly throughSeq: number
+  }
+
 /** One message-aligned backwards-history request. */
 export interface SessionPageRequest {
   readonly address: SessionAddress
-  /** Inclusive log cut obtained from the corresponding follow opening frame. */
+  /** Inclusive log cut obtained from a resident head or the corresponding follow opening frame. */
   readonly throughSeq: number
   readonly beforeSeq?: number
   readonly maxMessages?: number

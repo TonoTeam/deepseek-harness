@@ -19,6 +19,8 @@ kind: "package-reference"
 - [已知限制与延期工作](#known-limitations-and-deferred-work)
 - [开发备注](#dev-note)
 
+`session/head` 是已认证通道上的同步只读方法，只接受 `{ address: { kind: "session", sessionId } }`。冷会话或未知会话返回 `{ resident: false }`，不查询持久化、不加载或激活 Agent。与普通地址的 page 读取一致，没有工作目录的常驻会话不可见，subagent 来源的会话被拒绝。常驻会话返回 `residentId`、最小不可变 `header`（`id`、`version`、`createdAt`、`isSeeded`）和当前包含末项的 `throughSeq`（空日志为 `-1`）。实例标识在 Session 对象被替换或进程重启后变化，同一仅追加对象脱离后重新进入则保持原标识；结果没有路径或事件内容，也不写日志。调用方按此水位读取 `session/page` 的完整连续前缀后，必须再次读取 head 并核对实例、header 与水位全部一致。稳定水位仅代表一次观察，不构成授权，也不保证之后没有追加。
+
 -----
 
 <a id="use-this-package"></a>
