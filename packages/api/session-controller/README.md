@@ -22,6 +22,8 @@ Desktop analytics follows the [product collection policy](../../client/product-a
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
 - [Dev Note](#dev-note)
 
+`session/head` is an authenticated, synchronous read of one resident Session. It accepts only `{ address: { kind: "session", sessionId } }` and returns `{ resident: false }` without consulting persistence for a cold or unknown Session. As with ordinary-address pages, resident Sessions without a workspace directory are hidden and subagent-origin Sessions are rejected. A resident reply contains `residentId`, the minimal immutable `header` (`id`, `version`, `createdAt`, `isSeeded`), and the current inclusive `throughSeq` (`-1` for an empty log). The opaque instance identity changes when the Session object is replaced or the process restarts; detaching and re-entering the same append-only object preserves it. It exposes no paths or event bodies, does not activate an Agent, and writes no log. A caller reading `session/page` at this cut must read the complete dense prefix and then repeat `session/head`; both resident identities, headers, and cuts must agree. A stable cut is only an observation, not authorization or a promise against future appends.
+
 -----
 
 <a id="use-this-package"></a>

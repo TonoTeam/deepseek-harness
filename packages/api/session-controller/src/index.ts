@@ -51,6 +51,8 @@ import type {
   SessionListValue,
   SessionOpenWorkspacePathRequest,
   SessionOpenWorkspacePathValue,
+  SessionHeadRequest,
+  SessionHeadValue,
   SessionPage,
   SessionPageRequest,
   SessionPromptRequest,
@@ -513,6 +515,16 @@ export class SessionController extends TypertRemoteService {
   @Remote('cancel')
   cancel(request: SessionCancelRequest): SessionCancelValue {
     return this.commands.cancel(request)
+  }
+
+  /**
+   * Read the current log cut of one resident Session without loading or promoting it.
+   * @param request - exact Session identity.
+   * @returns attached instance identity and inclusive log cut, or resident false.
+   */
+  @Remote('head')
+  head(request: SessionHeadRequest): SessionHeadValue {
+    return this.history.head(request)
   }
 
   /**

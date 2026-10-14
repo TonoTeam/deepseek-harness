@@ -1,5 +1,6 @@
 /** Cold Session history pagination and live-event source. */
 
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { Deque } from '@deepseek-ai/dsh-deque'
 import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
@@ -9,6 +10,7 @@ import {
   SessionSeq,
 } from '@deepseek-ai/dsh-session'
 import type {
+  Session,
   SessionEvent,
   SessionHeader,
   SessionId,
@@ -26,6 +28,8 @@ import type {
   SessionFollowRequest,
   SessionFollowFrame,
   SessionHistoryRecord,
+  SessionHeadRequest,
+  SessionHeadValue,
   SessionPage,
   SessionPageRequest,
   SessionProjectionBaseline,
@@ -40,6 +44,7 @@ const MESSAGE_TYPES = new Set(['user/message', 'assistant/message'])
 
 /** Implements cold-safe history operations delegated by the Session Controller. */
 export class SessionHistoryController {
+  private readonly residentIds = new WeakMap<Session, string>()
   private readonly closeFollowers = new Set<() => void>()
   private readonly assistantStreams = new Map<SessionId, SessionAssistantStreamAccumulator>()
 
@@ -66,6 +71,35 @@ export class SessionHistoryController {
       for (const close of this.closeFollowers) close()
       this.closeFollowers.clear()
     }, 'session-controller.history')
+  }
+
+  /**
+   * Capture the attached Session instance and its current log cut synchronously.
+   * @param request - exact Session identity; subagent addresses are not accepted.
+   * @returns unavailable for nonresident Sessions, otherwise identity and inclusive log cut.
+   */
+  head(request: SessionHeadRequest): SessionHeadValue {
+    if (request.address.kind !== 'session'
+      || typeof request.address.sessionId !== 'string'
+      || request.address.sessionId.length === 0) {
+      throw new RemoteError('gateway/bad-request', 'head requires an exact session address', {})
+    }
+    const session = this.ctx.sessions.get(request.address.sessionId)
+    if (session === undefined) return { resident: false }
+    if (session.header.cwd === undefined) rejectNotFound(request.address)
+    validateAddress(request.address, session.header, session.inheritedEventCount, undefined)
+    let residentId = this.residentIds.get(session)
+    if (residentId === undefined) {
+      residentId = randomUUID()
+      this.residentIds.set(session, residentId)
+    }
+    const { version, id, createdAt, isSeeded } = session.header
+    return {
+      resident: true,
+      residentId,
+      header: { version, id, createdAt, isSeeded },
+      throughSeq: cursorBeforeNext(session.seq),
+    }
   }
 
   /**
