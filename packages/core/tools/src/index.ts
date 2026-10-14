@@ -597,8 +597,8 @@ export type PreToolDecision =
  * next request, or block by turning corrective feedback into an error result.
  */
 export type PostToolDecision =
-  | { kind: 'accept'; content?: ContentBlock[]; value?: never; additionalContexts?: UserMessage[] }
-  | { kind: 'accept'; value: JsonValue; content?: never; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; content?: ContentBlock[]; value?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
+  | { kind: 'accept'; value: JsonValue; content?: never; meta?: JsonValue; additionalContexts?: UserMessage[] }
   | { kind: 'block'; feedback: ContentBlock[]; additionalContexts?: UserMessage[] }
 
 /**
@@ -1779,11 +1779,13 @@ export class ToolRuntime extends Service {
       const replaced = this.createSuccessResult(exec, tool, decision.value)
       return this.markCanonical(exec, {
         ...replaced,
+        ...decision.meta !== undefined ? { meta: decision.meta } : {},
         ...additionalContexts.length > 0 ? { additionalContexts } : {},
       })
     }
     return this.markCanonical(exec, {
       ...result,
+      ...decision.meta !== undefined ? { meta: decision.meta } : {},
       ...decision.content !== undefined ? { content: decision.content } : {},
       ...additionalContexts.length > 0 ? { additionalContexts } : {},
     })

@@ -176,9 +176,29 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     return run
   }
 
+  let toolListTimer: ReturnType<typeof setTimeout> | undefined
+
+  function stopToolListPolling(): void {
+    if (toolListTimer !== undefined) clearTimeout(toolListTimer)
+    toolListTimer = undefined
+  }
+
+  function scheduleToolListPolling(generation: Client): void {
+    const interval = config.toolListRefreshMs ?? 0
+    if (interval === 0 || !isCurrent(generation) || connectedAt === undefined) return
+    toolListTimer = setTimeout(() => {
+      toolListTimer = undefined
+      void enqueueSync(generation).catch((error: unknown) => {
+        if (isCurrent(generation)) ctx.logger.error(`${label}: tool list polling failed: ${String(error)}`)
+      }).finally(() => { scheduleToolListPolling(generation) })
+    }, interval)
+    toolListTimer.unref()
+  }
+
   /** One disconnect decision per generation: the isCurrent guard makes racing close/error signals idempotent. */
   function generationDown(generation: Client): void {
     if (!isCurrent(generation)) return
+    stopToolListPolling()
     client = undefined
     closeClient = undefined
     scheduleReconnect()
@@ -339,6 +359,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     if (!isCurrent(generation)) return
     serverInstructions = instructions
     connectedAt = Date.now()
+    scheduleToolListPolling(generation)
     if (failedAttempts > 0) ctx.logger.info(`${label}: reconnected and re-synced tools (attempt ${failedAttempts}/${policy.maxAttempts})`)
   }
 
@@ -387,6 +408,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     },
     async dispose(): Promise<void> {
       disposed = true
+      stopToolListPolling()
       serverInstructions = ''
       if (reconnectTimer !== undefined) {
         clearTimeout(reconnectTimer)

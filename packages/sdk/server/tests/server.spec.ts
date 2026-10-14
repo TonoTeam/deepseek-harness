@@ -1133,7 +1133,9 @@ describe('HarnessSdkJsonRpcServer', () => {
     const ctx = {
       on: vi.fn(() => () => undefined),
       agents: { create, get: () => undefined },
-      get: () => ({ listProviders: () => [{ id: 'mock', name: 'Mock' }], resolveCallConfig }),
+      // Only the LLM seam answers here: an unnamed `get` would also stand in for
+      // the agent-preset roster, which this composition does not mount.
+      get: (name: string) => name === 'llm' ? { listProviders: () => [{ id: 'mock', name: 'Mock' }], resolveCallConfig } : undefined,
     } as unknown as Context
     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport()) as unknown as {
       initialize(params: { cwd: string; provider: string; model: string; reasoningEffort?: string; maxTokens?: number }): Promise<unknown>
@@ -1198,5 +1200,54 @@ describe('HarnessSdkJsonRpcServer', () => {
 
     await expect(server.shutdown()).rejects.toBe(listenerFailure)
     expect(on).toHaveBeenCalledTimes(4)
+  })
+
+  it('joins the roster default preset when the composition mounts agent presets', async () => {
+    const agent = ({ id: SessionId('preset'), followup: vi.fn() } satisfies Pick<Agent, 'id' | 'followup'>) as unknown as Agent
+    const handle = { agent, dispose: vi.fn(() => Promise.resolve()) }
+    const agentCtx = { scoped: true } as unknown as Context
+    const create = vi.fn(async (options: { setup?: (agentCtx: Context, agent: Agent) => unknown }) => {
+      await options.setup?.(agentCtx, agent)
+      return handle
+    })
+    const presets = {
+      resolve: vi.fn(async () => ({ id: 'standard' })),
+      mount: vi.fn(async () => ({ id: 'standard' })),
+    }
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: { create, get: () => agent },
+      get: (name: string) => name === 'agentPresets' ? presets : undefined,
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    ;(server as unknown as { initialized: boolean }).initialized = true
+
+    await server.prompt({ sessionId: 'preset', contentBlocks: [{ type: 'text', text: 'hello' }] })
+
+    expect(presets.resolve).toHaveBeenCalledWith()
+    expect(create).toHaveBeenCalledOnce()
+    expect(create.mock.calls[0]?.[0]).toMatchObject({ meta: { agentPreset: 'standard' } })
+    expect(presets.mount).toHaveBeenCalledWith(agentCtx, 'standard')
+    await server.shutdown()
+  })
+
+  it('composes an SDK session from the host plane when no roster is mounted', async () => {
+    const agent = ({ id: SessionId('plain'), followup: vi.fn() } satisfies Pick<Agent, 'id' | 'followup'>) as unknown as Agent
+    const handle = { agent, dispose: vi.fn(() => Promise.resolve()) }
+    const create = vi.fn(async (_options: unknown) => handle)
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: { create, get: () => agent },
+      get: () => undefined,
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    ;(server as unknown as { initialized: boolean }).initialized = true
+
+    await server.prompt({ sessionId: 'plain', contentBlocks: [{ type: 'text', text: 'hello' }] })
+
+    const options = create.mock.calls[0]?.[0] as { meta?: Record<string, unknown>; setup?: unknown } | undefined
+    expect(options?.meta).not.toHaveProperty('agentPreset')
+    expect(options).not.toHaveProperty('setup')
+    await server.shutdown()
   })
 })
