@@ -6,6 +6,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
+import type {} from '@deepseek-ai/dsh-session-projection'
 import { resolve } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -396,10 +398,17 @@ export class HarnessSdkJsonRpcServer {
   }
 
   private async createSession(sessionId: string, resume: boolean): Promise<SessionRecord> {
-    // No preset composition: this server's compositions keep the model-facing
-    // rows in the host plane, so this agent reads them from the global layer. A
-    // deployment that configures a roster has to join one here first
-    // (@deepseek-ai/dsh-agent-preset-registry README, "Composing a child agent").
+    // SDK and browser sessions share the deployment's preset registry.
+    const presets = this.ctx.get('agentPresets')
+    const agentPreset = presets === undefined ? undefined : (await presets.resolve()).id
+    const setup = presets === undefined ? {} : {
+      setup: async (agentCtx: Context, agent: Agent) => {
+        const selected = resume
+          ? this.ctx.sessionProjections.stateOf(agent.session, 'agentPreset') ?? agentPreset
+          : agentPreset
+        await presets.mount(agentCtx, selected)
+      },
+    }
     const agentOptions = {
       provider: this.provider,
       model: this.model,
@@ -408,10 +417,12 @@ export class HarnessSdkJsonRpcServer {
     }
     const handle = await (resume ? this.ctx.agents.resume({
       resumeSessionId: brandString<SessionId>(sessionId),
+      ...setup,
       agentOptions,
     }) : this.ctx.agents.create({
       sessionId: brandString<SessionId>(sessionId),
-      meta: { cwd: this.cwd },
+      meta: { cwd: this.cwd, ...agentPreset === undefined ? {} : { agentPreset } },
+      ...setup,
       agentOptions,
     }))
     const rec: SessionRecord = { handle, failure: undefined }

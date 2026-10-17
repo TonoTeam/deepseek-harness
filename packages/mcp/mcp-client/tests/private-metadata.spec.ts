@@ -2,7 +2,7 @@ import { expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, ToolCallId, type StreamChunk, LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
+import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness, provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { PtcRuntime, type PtcRunRequest, type PtcRunResult, type PtcRunSpec } from '@deepseek-ai/dsh-ptc-runtime'
 import { createMcpToolDefinition } from '../src/index.ts'
 class MetadataAdapter extends LlmAdapter {
@@ -32,8 +32,9 @@ function response(name: string, args: object): StreamChunk[] {
   ]
 }
 
-async function setup(mode: 'native' | 'both' = 'native') {
+async function setup(mode: 'native' | 'ptc' = 'native') {
   const ctx = new Context()
+  provideWorkingDirectoryFixture(ctx)
   await mountAgentLoopTestDependencies(ctx, { tools: { mode } })
   const driver = await mountAgentLoopTestHarness(ctx)
   ctx.tools.register(createMcpToolDefinition(ctx, {
@@ -82,7 +83,7 @@ it('persists Native root metadata privately on actual success and error session 
       expect(JSON.stringify(event.data.message)).not.toContain('native-private')
       await expect.poll(() => adapter.requests.length).toBe(2)
       expect(JSON.stringify(adapter.requests.map(request => request.messages))).not.toContain('"reference"')
-      expect(event.data.message.content.find(block => block.type === 'tool-result')?.isError).toBe(fail)
+      expect(event.data.message.isError === true).toBe(fail)
     } finally { await ctx.fiber.dispose() }
   }
 })
@@ -102,13 +103,14 @@ class MetadataRuntime extends PtcRuntime {
 }
 
 it('persists PTC child success and error metadata outside program values and root model content', async () => {
-  const { ctx, driver } = await setup('both')
+  const { ctx, driver } = await setup('ptc')
   try {
     await ctx.plugin(MetadataRuntime)
     const adapter = new MetadataAdapter([response('run_code', { code: 'synthetic program', description: 'Synthetic program' }), finished])
     ctx.llm.registerAdapter(['mock'], adapter)
     const agent = await driver.create(SessionId('metadata-ptc'), { provider: 'mock', model: 'mock' })
     agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'observe' }] }))
+    await agent.whenIdle()
     await expect.poll(() => agent.session.snapshotEvents().filter(e => e.type === 'tool/ptc-dispatch').length).toBe(2)
     const children = agent.session.snapshotEvents().filter(e => e.type === 'tool/ptc-dispatch')
     expect(children.map(e => e.data.meta)).toEqual(['child-success', 'child-error'].map(reference => ({ mcp: { reference, untrusted: { approved: true } } })))
