@@ -1,8 +1,6 @@
 /** Resident-only head reads and stable-cut checks over the real Session store. */
-import { createServer } from 'node:http'
-import type { AddressInfo } from 'node:net'
 import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
-import type { WebServer, WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import WebServer from '@deepseek-ai/dsh-host-webserver'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import TypertGateway from '@deepseek-ai/dsh-api-gateway'
@@ -17,16 +15,9 @@ import { createSessionTestController, installSessionReadTestServices } from './t
 /** Exercise the real Connection authentication and unary Gateway using a local descriptor. */
 async function checkHeadWire(): Promise<void> {
   const ctx = new Context()
-  const routes: WebRoute[] = []
-  const server = createServer((request, response) => { void routes[0]!.handler(request, response) })
   try {
     provideBrowserCredentials(ctx)
-    ctx.provide('webServer', {
-      port: 0,
-      tapIndex: () => () => {},
-      register: (route: WebRoute) => { routes.push(route); return () => { routes.splice(routes.indexOf(route), 1) } },
-    // This local Connection fixture only consumes registration and port, not the full WebServer lifecycle.
-    } as unknown as WebServer)
+    await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
     await ctx.plugin({ inject: [...connectionInject], apply: applyConnection })
     await ctx.plugin(TypertRegistry)
     await ctx.plugin(TypertGateway)
@@ -46,8 +37,7 @@ async function checkHeadWire(): Promise<void> {
       }],
     })
     const session = ctx.sessions.create(undefined, { meta: { cwd: '/workspace' } })
-    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-    const origin = `http://127.0.0.1:${String((server.address() as AddressInfo).port)}`
+    const origin = `http://127.0.0.1:${String(ctx.webServer.port)}`
     const body = JSON.stringify({ type: 'client-request', rpcId: 'local-head', method: 'session/head',
       payload: { args: { request: { address: { kind: 'session', sessionId: session.id } } } } })
     const denied = await fetch(`${origin}/api/session/head`, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
@@ -67,7 +57,6 @@ async function checkHeadWire(): Promise<void> {
     } })
     expect(session.seq).toBe(0)
   } finally {
-    if (server.listening) await new Promise<void>((resolve, reject) => server.close((error) => { if (error) reject(error); else resolve() }))
     await ctx.fiber.dispose()
   }
 }
