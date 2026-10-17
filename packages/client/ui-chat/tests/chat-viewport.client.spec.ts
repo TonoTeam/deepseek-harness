@@ -2,6 +2,7 @@
 
 import { expect, it, onTestFinished, vi } from 'vitest'
 import { ChatViewport } from '../src/client/chat/use-chat-viewport.ts'
+import { ScrollFollow, scrollMetrics } from '../src/client/chat/use-scroll-follow.ts'
 
 function fixture() {
   const column = document.createElement('div')
@@ -47,10 +48,19 @@ function fixture() {
   return { column, viewport, group, row, prepend: (height: number) => { prependedHeight += height } }
 }
 
-it.each([64, 4096])('locates the reading Turn with logarithmic outer-row measurements (%s rows)', (count) => {
+it.each([
+  { count: 64, slot: false }, { count: 4096, slot: false },
+  { count: 64, slot: true }, { count: 4096, slot: true },
+])('locates the reading Turn with logarithmic outer-row measurements ($count rows, slot=$slot)', ({ count, slot }) => {
   const h = fixture()
+  const parent = slot ? document.createElement('div') : h.column
+  if (slot) {
+    parent.dataset.slot = 'conversation.chat.flow'
+    parent.style.display = 'contents'
+    h.column.append(parent)
+  }
   const rows = Array.from({ length: count }, (_, index) => {
-    const row = h.row(h.column, `turn-${index + 1}`, index * 100)
+    const row = h.row(parent, `turn-${index + 1}`, index * 100)
     row.dataset.chatTurn = String(index + 1)
     return row
   })
@@ -428,6 +438,32 @@ it.each([
   expect(h.body.scrollTop).toBe(test.expectedInner)
   expect(h.scroller.scrollTop).toBe(test.expectedOuter)
   expect(h.row.getBoundingClientRect().top).toBe(top)
+})
+
+it('gives paging compensation priority over an active inner follow animation', () => {
+  const h = nestedFixture(600, 400)
+  const follow = new ScrollFollow(true, 1)
+  onTestFinished(follow.bind(h.body))
+  const scrollTo = vi.fn((options?: ScrollToOptions | number, y?: number) => {
+    if (typeof options === 'number') h.body.scrollTop = y ?? 0
+    else if (options?.behavior === 'instant') h.body.scrollTop = options.top ?? 0
+  })
+  h.body.scrollTo = scrollTo
+  h.body.scrollTop = 100
+  const top = h.begin()
+  follow.toBottom(h.body, scrollMetrics(h.body), 'smooth')
+  expect(follow.animating).toBe(true)
+  h.prepend(200)
+  h.viewport.preserve()
+  expect(h.row.getBoundingClientRect().top).toBe(top)
+  expect(scrollTo).toHaveBeenLastCalledWith({ top: 300, behavior: 'instant' })
+  expect(follow.animating).toBe(false)
+  expect(follow.active).toBe(false)
+  follow.sample(scrollMetrics(h.body))
+  follow.settle(scrollMetrics(h.body))
+  expect(follow.active).toBe(false)
+  h.body.scrollTop = scrollMetrics(h.body).floor
+  expect(follow.sample(scrollMetrics(h.body))).toBe(true)
 })
 
 it.each(['wheel', 'touchstart', 'pointerdown', 'keydown', 'beforematch'])(

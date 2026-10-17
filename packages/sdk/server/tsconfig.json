@@ -18,7 +18,7 @@
       "path": "../../llm/llm"
     },
     {
-      "path": "../../llm/llm-deepseek"
+      "path": "../../llm/llm-deepseek-api-key"
     },
     {
       "path": "../../core/agent"
@@ -34,6 +34,15 @@
     },
     {
       "path": "../../subagent/subagent"
+    },
+    {
+      "path": "../../session/working-directory"
+    },
+    {
+      "path": "../../preset/agent-preset-registry"
+    },
+    {
+      "path": "../../session/session-projection"
     }
   ]
 }

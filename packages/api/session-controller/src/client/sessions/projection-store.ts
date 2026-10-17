@@ -6,8 +6,8 @@
  * (`{ value, seq }`) comes from the connected Host — a follow opening
  * baseline, a Session Controller `projection` frame, a list block the Host
  * computed for an attached Session — and merges under **higher seq wins**
- * against other sequenced rows. A `cached` row (`{ value }`) comes from the
- * session list's view of the persisted checkpoint, carries no comparable
+ * against other sequenced rows. A `cached` row (`{ value }`) comes from
+ * a Host view of the persisted checkpoint, carries no comparable
  * seq, and yields to every sequenced write. No client-side domain folding
  * exists: a domain ships projection support with zero client code. Per-key
  * bare observable faces feed `useProjection` (ui-renderer binds them).
@@ -118,6 +118,16 @@ export class ProjectionValueStore {
   }
 
   /**
+   * Read the accepted Host watermark without subscribing or copying a value.
+   * @param key - projection key.
+   * @returns the current sequence, or undefined for absent and cached values.
+   */
+  seqOf(key: string): SessionSeqCursor | undefined {
+    const row = this.rows.get(key)
+    return row?.kind === 'sequenced' ? row.seq : undefined
+  }
+
+  /**
    * Read every current projection value as one reference-stable snapshot.
    * @returns The same frozen value map until a row changes.
    */
@@ -156,7 +166,7 @@ export class ProjectionValueStore {
   }
 
   /**
-   * Fill keys from a session-list block the Host labeled `cached`: a zero-I/O
+   * Fill keys from a Host block labeled `cached`: a zero-I/O
    * view of the persisted checkpoint. A cached value lands only where no
    * sequenced row exists: a connected Session has already answered for such
    * a key, and the list's view of the persisted checkpoint cannot be newer

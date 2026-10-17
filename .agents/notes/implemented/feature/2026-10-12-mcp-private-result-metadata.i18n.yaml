@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-10-12-mcp-private-result-metadata.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-10-12-mcp-private-result-metadata.md
+/agent-note-mcp-private-result-metadata:
+  en: 9ff300210f8e72b0
+  zh: e4781b48b3d3980e
+/agent-note-mcp-private-result-metadata/problem:
+  en: 98cc33cca7119868
+  zh: bef8927ab9763feb
+/agent-note-mcp-private-result-metadata/decision:
+  en: 9cdee57e303080e4
+  zh: dba79877c6845e20
+/agent-note-mcp-private-result-metadata/alternatives-considered:
+  en: 49cfd20e6bf922d0
+  zh: 1f4f7558d82161fe
+/agent-note-mcp-private-result-metadata/consequences:
+  en: e6e3760c0e27817c
+  zh: 56d4735826abad34

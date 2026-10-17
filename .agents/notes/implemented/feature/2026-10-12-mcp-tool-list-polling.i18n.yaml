@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-10-12-mcp-tool-list-polling.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-10-12-mcp-tool-list-polling.md
+/agent-note-mcp-tool-list-polling:
+  en: f1031fa96693e686
+  zh: e3723be67403aa4f
+/agent-note-mcp-tool-list-polling/problem:
+  en: 40b7029fbaca711a
+  zh: a15879873a3a4573
+/agent-note-mcp-tool-list-polling/decision:
+  en: c37b4abfd8dba579
+  zh: bf50c3ce6ac23c96
+/agent-note-mcp-tool-list-polling/consequences:
+  en: 8980c40b853942d1
+  zh: 0b79476f78fe4cc6
+/agent-note-mcp-tool-list-polling/alternatives-considered:
+  en: c2e692dfb0b4a0bd
+  zh: 0b5c9c6621436351

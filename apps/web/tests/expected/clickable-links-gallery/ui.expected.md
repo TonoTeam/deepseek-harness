@@ -7,35 +7,37 @@
     - tab "Trajectory"
 - text: "Assemble the link gallery: write the report and styles, inspect the sources, and summarize. {{clock}}"
 - button "Copy"
-- status: Worked
-- button "Took {{duration}}" [expanded]
-- button "Edited files, called tools, searched code, etc." [expanded]
-- button "Write site/report.html +1 -0":
+- status: Completed
+- button "Completed in {{duration}}" [expanded]
+- button "Wrote files, ran commands, called tools, etc." [expanded]
+- button "Write site/report.html 1KB +1 -0":
   - text: Write
   - button "site/report.html"
-  - text: +1 -0
-- button "Write a/style.css +1 -0":
+  - text: 1KB +1 -0
+- button "Write a/style.css 1KB +1 -0":
   - text: Write
   - button "a/style.css"
-  - text: +1 -0
-- button "Write b/style.css +1 -0":
+  - text: 1KB +1 -0
+- button "Write b/style.css 1KB +1 -0":
   - text: Write
   - button "b/style.css"
-  - text: +1 -0
-- button "Write site/index.html +1 -0":
+  - text: 1KB +1 -0
+- button "Write site/index.html 1KB +1 -0":
   - text: Write
   - button "site/index.html"
-  - text: +1 -0
-- button "Write site/app.js +1 -0":
+  - text: 1KB +1 -0
+- button "Write site/app.js 1KB +1 -0":
   - text: Write
   - button "site/app.js"
-  - text: +1 -0
-- button "Edit src/tokens.css +1 -1" [expanded]:
+  - text: 1KB +1 -0
+- button "Edit src/tokens.css 1KB +1 -1" [expanded]:
   - text: Edit
   - button "src/tokens.css"
-  - text: +1 -1
+  - text: 1KB +1 -1
+- text: css
+- button "Wrap lines"
 - button "Copy"
-- text: "src/tokens.css - --inline-code: #EBEEF2; + --inline-code: #F5F5F5; └ +1 -1 · 1 file"
+- text: "src/tokens.css - --inline-code: #EBEEF2; + --inline-code: #F5F5F5;"
 - button "Inspect"
 - button "Tool call str_replace_editor · create" [expanded]
 - text: "IN { \"command\": \"create\", \"path\": \"docs/press.md\", \"file_text\": \"# Press kit\\n\" } OUT Created docs/press.md"
@@ -45,7 +47,8 @@
 - button "Read docs/guide.md" [expanded]:
   - text: Read
   - button "docs/guide.md"
-- text: docs/guide.md
+- text: Code block docs/guide.md
+- button "Wrap lines"
 - button "Copy"
 - text: "# Link style guide guide line 2 guide line 3 guide line 4"
 - button "Expand 4 more lines": … 4 more lines
@@ -62,10 +65,16 @@
 - button "Inspect"
 - button "Glob **/*.css"
 - button "Bash List the built site"
-- button "Failed Bash Run the lint gate" [expanded]
+- button "Failed Bash Run the lint gate exit code 1" [expanded]
 - text: Failed site pnpm run lint exit code 1
 - button "Copy"
 - text: "style.css: unexpected hex literal"
+- button "Inspect"
+- button "Failed Bash Check every generated stylesheet and component theme against the shared design tokens, inspect the application pages for inconsistent colors, and report all remaining lint failures before publishing the production build exit code 1"
+- button "Failed Bash Build the site no exit code" [expanded]
+- text: Failed site pnpm run build no exit code
+- button "Copy"
+- text: (no output) [timed out after {{duration}}]
 - button "Inspect"
 - button "Search clickable link styles, produced files ui" [expanded]
 - paragraph:
@@ -80,7 +89,10 @@
     - text: One cursor token, one focus ring.
   - listitem: Mirror spec (non-http) A non-http source renders inert.
 - button "Inspect"
-- button "Fetch https://docs.example.test/tokens" [expanded]
+- button "Fetch https://docs.example.test/tokens" [expanded]:
+  - text: Fetch
+  - link "https://docs.example.test/tokens":
+    - /url: https://docs.example.test/tokens
 - link "https://docs.example.test/tokens":
   - /url: https://docs.example.test/tokens
 - text: HTTP 200
@@ -134,8 +146,10 @@
   - code: notes.md
   - text: untouched.
 - paragraph:
-  - img "Token preview"
+  - 'button "View full image: Token preview"':
+    - img "Token preview"
 - text: css
+- button "Wrap lines" [pressed]
 - button "Copy"
 - code: "--inline-code: #F5F5F5;"
 - paragraph: LINK_GALLERY_DONE

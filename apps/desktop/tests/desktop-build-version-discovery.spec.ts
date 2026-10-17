@@ -70,4 +70,23 @@ describe('desktop build version discovery', () => {
     await expect(suggestDesktopBuildVersion({ productVersion: PRERELEASE, target: 'mac-arm64', environment: {}, date: DATE, artifactsRoot }))
       .resolves.toBe(`${PRERELEASE}.${DATE}.4`)
   })
+
+  it('numbers after existing unnotarized DMG and ZIP artifacts', async () => {
+    const artifactsRoot = await artifactsWith([
+      `deepseek-harness-${PRERELEASE}.${DATE}.2-mac-arm64-unnotarized.dmg`,
+      `deepseek-harness-${PRERELEASE}.${DATE}.4-mac-arm64-unnotarized.zip`,
+      `deepseek-harness-${PRERELEASE}.${DATE}.9-mac-arm64-unnotarized.zip.blockmap`,
+    ])
+    await expect(suggestDesktopBuildVersion({ productVersion: PRERELEASE, target: 'mac-arm64', environment: {}, date: DATE, artifactsRoot }))
+      .resolves.toBe(`${PRERELEASE}.${DATE}.5`)
+  })
+
+  it('counts unsigned Windows artifacts written under their own suffix', async () => {
+    const artifactsRoot = await artifactsWith([
+      `deepseek-harness-${PRERELEASE}.${DATE}.2-win-x64-unsigned.exe`,
+      `deepseek-harness-${PRERELEASE}.${DATE}.5-win-x64-unsigned.exe.blockmap`,
+    ])
+    await expect(suggestDesktopBuildVersion({ productVersion: PRERELEASE, target: 'win-x64', environment: {}, date: DATE, artifactsRoot }))
+      .resolves.toBe(`${PRERELEASE}.${DATE}.3`)
+  })
 })

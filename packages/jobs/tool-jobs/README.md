@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use `dsh-tool-jobs` to inspect and control background commands, PTY work, and subagents through `job_output`, `job_list`, and `job_kill`. Reads can wait within a configured timeout, list results identify each job's kind and status, and cancellation settles only after the work stops. When owned work finishes, the agent receives an in-session notice: busy agents receive it in their next step, while idle agents may be woken by a bounded follow-up turn. Configuration controls wait limits, completion delivery, and consecutive wakeups. Stream output is consumed by one reader, and pending notices do not survive owner disposal.
+Use `dsh-tool-jobs` to inspect and control background commands and PTY work through `job_output`, `job_list`, and `job_kill`. Reads can wait within a configured timeout, list results identify each job's kind and status, and cancellation settles only after the work stops. When owned work finishes, the agent receives an in-session notice: busy agents receive it in their next step, while idle agents are woken by a follow-up turn. Configuration controls wait limits, completion delivery, and an optional cap on consecutive wakeups. Stream output is consumed by one reader, and pending notices do not survive owner disposal.
 
 ## Table of Contents
 
@@ -39,7 +39,7 @@ The three tools return `{ text, job }`, `PublicJobSnapshot[]`, and `{ outcome: '
 
 When a job finishes, the owning agent receives `background job <id> (<kind>: <label>) finished [status: ...]. Read its output with job_output.` as an in-session message. A busy agent has the notice injected into its next step — the turn cannot close while the inbox holds it, so several jobs settling together cost one step rather than one turn each. An idle agent is instead woken with a follow-up turn, because an unclaimed notice is a completion the model never learns about. Completions the model already collected get no notice: the registry reports a settlement that released a live `wait` as `awaited` — whether a `job_output` wait or a shell tool waiting on its own foreground command — and the plugin remembers the kills the model requested through `job_kill`; a settlement caused by owner or service teardown is skipped because nobody is left to read it.
 
-Waking is bounded: each owner may be woken `maxConsecutiveWakes` times before further notices degrade to injection, and claiming any user-authored message restores the budget. The bound exists because the chain is self-exciting — a woken turn may start the background job whose completion wakes it again. `completionDelivery: quiet` keeps even idle owners on the injection lane, which deterministic transcripts need.
+Waking is unbounded by default: an unattended agent that chains background commands and one-shot subagents is woken for every completion. `maxConsecutiveWakes` caps that: each owner may be woken that many times before further notices degrade to injection, and claiming any user-authored message restores the budget. The cap bounds the self-exciting chain — a woken turn may start the background job whose completion wakes it again — but a notice past it waits silently until the next user input, so a session that relies on wakes to finish its work stalls there. `completionDelivery: quiet` keeps even idle owners on the injection lane, which deterministic transcripts need.
 
 ### Minimal configuration
 
@@ -54,7 +54,7 @@ Loading the plugin with no config is the common path; a `waitTimeoutMs` above `m
 | `waitTimeoutMs` | `30,000` | Wait used when `wait: true` omits `timeout_ms` |
 | `maxWaitTimeoutMs` | `600,000` | Cap for model-supplied waits; larger values clamp down to it |
 | `completionDelivery` | `wakeup` | `wakeup` opens a turn on an idle owner; `quiet` leaves the notice pending |
-| `maxConsecutiveWakes` | `3` | Turns one owner may open by wake before notices degrade to injection |
+| `maxConsecutiveWakes` | unset | Turns one owner may open by wake before notices degrade to injection; unset means no cap |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-tool-jobs) is the exhaustive source for every accepted field and its JSDoc.
 
@@ -74,7 +74,7 @@ This section explains the design decisions behind the tools and points at the co
 
 ### Design philosophy
 
-- **Kind-independent controls.** The same three tools read, list, and cancel jobs of every producer kind — bash, subagent, PTY — because all of them register through the generic `ctx.jobs` runtime.
+- **Kind-independent controls.** The same three tools read, list, and cancel jobs of every producer kind — bash, PTY — because all of them register through the generic `ctx.jobs` runtime.
 - **Delivery is owned here; recipients are the registry's.** The plugin decides how an unreported completion reaches the owner — injected into a busy step, or a woken turn on an idle owner — while the registry routes each settlement to the listeners its owner's scope chain reaches, so a mount under one preset never sees another preset's agents, and an agent reads exactly one notice per completion however many presets are mounted.
 - **Producer-owned output bounds.** When a producer supplies `outputLimitBytes`, the complete model-facing result — output read, terminal kill snapshot, or completion notice — is capped after status and notice metadata are added; producers that omit it keep unbounded behavior.
 
@@ -84,15 +84,14 @@ This section explains the design decisions behind the tools and points at the co
 |---|---|
 | [`src/index.ts`](src/index.ts) | Plugin entry: tool registrations, the settlement subscription and model-kill set, prompt section, output capping |
 | [`src/render.ts`](src/render.ts) | Model-facing rendering: the public projection, status lines, and the consuming delta (stdout, `[stderr]` section, dropped-output notice) |
-| — | No runtime invariant companion is published; this model-facing adapter has no independent lifecycle stream; execution relations are owned by the capability seam it calls. |
 
 ### Output capping
 
-`job_output` and `job_kill` capture the caller-visible job in a prepended pre-execute listener before policy runs, so the producer's cap applies to the complete rendered result. `job_output` preserves its output/status split when policy left the default rendering intact, bounding the output tail and the `[status: ...]` suffix; other single-text results — denials, short-circuits, normalized tool or pipeline failures, replacements, and blocks — are bounded as one text, while structured multi-block policy results keep their shape. A bounded completion notice reserves the stable `background job <id>` prefix and the `job_output` collection instruction before spending remaining bytes on variable kind, label, status, detail, and truncation marker, so the notice stays actionable at the PTY's supported 64-byte minimum; an existing producer truncation marker is reused rather than duplicated.
+`job_output` and `job_kill` capture the caller-visible job in a prepended pre-execute listener before policy runs, so the producer's cap applies to the complete rendered result. `job_output` preserves its output/status split when policy left the default rendering intact, bounding the output tail and the `[status: ...]` suffix; other single-text results — denials, short-circuits, normalized tool or pipeline failures, replacements, and blocks — are bounded as one text, while structured multi-block policy results keep their shape. A bounded completion notice retains the full job id and `job_output` action when both fit. Otherwise it directs the model to `job_list` when at least eight bytes fit; a smaller cap can carry only a prefix. The PTY's supported 64-byte minimum fits the complete `job_list` instruction. Existing producer truncation markers are reused.
 
 ### Notice delivery lanes
 
-The settlement subscription (`{ owners: 'scope' }`) skips settlements the registry reports as `awaited`, jobs the model killed through `job_kill`, unowned jobs, and teardown settlements, then resolves the agent registered for the owner session. A `wakeup` delivery opens a turn on an idle owner while the budget lasts, tracked per exact `Agent` in a `WeakMap`; claiming a user-authored message (`agent/inbox/claimed`) resets that owner's budget. A busy owner — or any notice past the budget, or `quiet` delivery — is injected into the next-step inbox instead. The registry counts only a wait still owed the projection at settlement, so a wait that timed out or was aborted leaves a later settlement to notify as usual; a removal drops the job from the model-kill set, which only ever holds live jobs the model killed.
+The settlement subscription (`{ owners: 'scope' }`) skips settlements the registry reports as `awaited`, jobs the model killed through `job_kill`, unowned jobs, and teardown settlements, then resolves the agent registered for the owner session. A `wakeup` delivery opens a turn on an idle owner; with `maxConsecutiveWakes` set, only while the budget lasts, tracked per exact `Agent` in a `WeakMap`, and claiming a user-authored message (`agent/inbox/claimed`) resets that owner's budget. A busy owner — or any notice past a configured budget, or `quiet` delivery — is injected into the next-step inbox instead. The registry counts only a wait still owed the projection at settlement, so a wait that timed out or was aborted leaves a later settlement to notify as usual; a removal drops the job from the model-kill set, which only ever holds live jobs the model killed.
 
 </details>
 
@@ -158,7 +157,7 @@ Reads return output or `(no new output)` followed by `[status: <status>]` and op
 
 #### Token effect
 
-Results and notices remain in parent history until compaction. Stream reads do not repeat consumed output; a producer-supplied `outputLimitBytes` bounds each complete read or notice. Under `wakeup`, a notice reaching an idle owner also buys a model request the user did not ask for, capped per owner by `maxConsecutiveWakes`; a notice reaching a busy owner adds a step to the turn it is already paying for.
+Results and notices remain in parent history until compaction. Stream reads do not repeat consumed output; a producer-supplied `outputLimitBytes` bounds each complete read or notice. Under `wakeup`, a notice reaching an idle owner also buys a model request the user did not ask for, capped per owner only when `maxConsecutiveWakes` is set; a notice reaching a busy owner adds a step to the turn it is already paying for.
 
 #### KV Cache effect
 
@@ -172,7 +171,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 These limits define when the tools are a poor fit. They are current package constraints, not a task backlog.
 
 - **A settlement inside the driver's retirement window still strands its notice** — between the turn loop's last inbox check and the driver committing its idle phase the owner still reads as busy, so the notice is injected and nothing wakes. Steering has the same hole; closing it belongs to `agent-loop`.
-- **A spent wake budget is not restored by time** — only user-authored input refills it, so an unattended agent whose budget ran out collects its remaining notices on the next turn something else opens.
+- **A spent wake budget is not restored by time** — with `maxConsecutiveWakes` set, only user-authored input refills it, so an unattended agent whose budget ran out collects its remaining notices on the next turn something else opens, and nothing in the client shows that a notice is waiting.
 - **A notice pending on an idle owner does not survive that owner's disposal** — the disposal cancel clears the unclaimed inbox, and the log keeps the insert/cancel pair as the record.
 - **Model reads are single-consumer** — independent observers use the registry's non-consuming `readAt` (the Web client's `job.follow`), not these tools.
 - **Unowned jobs have no session fence** — external callers must supply policy or avoid them.

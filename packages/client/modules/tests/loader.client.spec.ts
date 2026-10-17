@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { removeOwnedStyles } from '../src/client/entry-lifecycle.ts'
+import { readRelease } from '../src/client/manifest.ts'
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -76,16 +77,25 @@ function bench(
     pending?: ClientBundleRegistration[]
     defaultTransport?: boolean
     chunks?: Record<string, Factory | null>
+    /** Remaining transport rejections per URL (the `<script>` error event). */
+    transportFailures?: Record<string, number>
+    /** URLs whose script loads but registers only the listed ids (a runtime throw after those registrations). */
+    registerOnly?: Record<string, string[]>
   } = {},
 ): Bench {
   const fetched: string[] = []
   const gates = new Map<string, () => void>()
   const target = registrationTarget(opts.pending)
   win.__ModuleLoader__ = target
+  const transportFailures = { ...opts.transportFailures }
   const loadBundle = async (url: string): Promise<void> => {
     fetched.push(url)
     if (opts.gated?.includes(url) === true) {
       await new Promise<void>((resolve) => { gates.set(url, resolve) })
+    }
+    if ((transportFailures[url] ?? 0) > 0) {
+      transportFailures[url] = (transportFailures[url] as number) - 1
+      throw new Error(`client-modules: bundle script ${url} failed to load`)
     }
     const sibling = /^plugins\/(.+)\/(client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js)\?rev=[^&]+$/.exec(url)
     if (sibling !== null) {
@@ -105,7 +115,9 @@ function bench(
     const singleId = combo?.split(',').length === 1 && combo.endsWith('/client.js')
       ? combo.slice(0, -'/client.js'.length)
       : undefined
+    const only = opts.registerOnly?.[url]
     for (const id of batchIds ?? (singleId === undefined ? [] : [singleId])) {
+      if (only !== undefined && !only.includes(id)) continue
       const factory = bundles[id]
       if (factory != null) win.__ModuleLoader__?.load({ id, factory })
     }
@@ -343,6 +355,134 @@ describe('lazy CJS arrival', () => {
   })
 })
 
+describe('bundle arrival recovery', () => {
+  const single = (id: string): string => comboReference([id], '0')
+
+  it('retries a batch once after a transport failure and shares the retry across its rows', async () => {
+    const b = bench([row('a'), row('b')], { a: () => ({ a: 1 }), b: () => ({ b: 2 }) }, {
+      transportFailures: { [APPLICATION_URL]: 1 },
+    })
+    const [a, c] = await Promise.all([b.loader.import('a', '', {}), b.loader.import('b', '', {})])
+    expect(a).toEqual({ a: 1 })
+    expect(c).toEqual({ b: 2 })
+    expect(b.fetched).toEqual([APPLICATION_URL, APPLICATION_URL])
+  })
+
+  it('falls back to each missing row\'s one-resource URL when the batch keeps failing, without re-fetching the batch per row', async () => {
+    const b = bench([row('a'), row('b')], { a: () => ({ a: 1 }), b: () => ({ b: 2 }) }, {
+      transportFailures: { [APPLICATION_URL]: 5 },
+    })
+    const [a, c] = await Promise.all([b.loader.import('a', '', {}), b.loader.import('b', '', {})])
+    expect(a).toEqual({ a: 1 })
+    expect(c).toEqual({ b: 2 })
+    expect(b.fetched.filter(url => url === APPLICATION_URL)).toHaveLength(2)
+    expect(b.fetched.slice(2).sort()).toEqual([single('a'), single('b')].sort())
+    expect(b.loader.importError('a')).toBeUndefined()
+  })
+
+  it('does not re-execute a batch that loaded without registering; the missing row loads alone', async () => {
+    const b = bench([row('a')], { a: () => ({ a: 1 }) }, { registerOnly: { [APPLICATION_URL]: [] } })
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    expect(b.fetched).toEqual([APPLICATION_URL, single('a')])
+  })
+
+  it('after a partially registering batch, loads only the missing row and never duplicates the registered one', async () => {
+    const b = bench([row('a'), row('b')], { a: () => ({ a: 1 }), b: () => ({ b: 2 }) }, {
+      registerOnly: { [APPLICATION_URL]: ['a'] },
+    })
+    expect(await b.loader.import('b', '', {})).toEqual({ b: 2 })
+    expect(b.fetched).toEqual([APPLICATION_URL, single('b')])
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    expect(b.fetched).toHaveLength(2)
+  })
+
+  it('never re-executes a batch that already ran, even when its first importer was one of the rows it did register', async () => {
+    const b = bench([row('a'), row('b')], { a: () => ({ a: 1 }), b: () => ({ b: 2 }) }, {
+      registerOnly: { [APPLICATION_URL]: ['a'] },
+    })
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    expect(b.fetched).toEqual([APPLICATION_URL])
+    expect(await b.loader.import('b', '', {})).toEqual({ b: 2 })
+    expect(b.fetched).toEqual([APPLICATION_URL, single('b')])
+  })
+
+  it('reports every attempt when the one-resource fallback fails too', async () => {
+    const b = bench([row('a')], { a: () => ({ a: 1 }) }, {
+      transportFailures: { [APPLICATION_URL]: 2, [single('a')]: 1 },
+    })
+    const failure: unknown = await b.loader.import('a', '', {}).then(() => undefined, (error: unknown) => error)
+    if (!(failure instanceof Error)) throw new Error('import resolved')
+    expect(failure.message).toContain('could not load "a"')
+    const batchAttempts = failure.message.split(`${APPLICATION_URL}: client-modules: bundle script`).length - 1
+    expect(batchAttempts).toBe(2)
+    expect(failure.message).toContain(`${single('a')}: client-modules: bundle script`)
+    expect(b.fetched).toEqual([APPLICATION_URL, APPLICATION_URL, single('a')])
+  })
+
+  it('a one-resource URL that fails stays retryable on the next import instead of being remembered as a failed batch', async () => {
+    const reloadUrl = comboReference(['a'], '1')
+    const b = bench([row('a')], { a: () => ({ a: 1 }) }, { transportFailures: { [reloadUrl]: 2 } })
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    b.loader.invalidate('a', '1')
+    await expect(b.loader.import('a', '', {})).rejects.toThrow('could not load "a"')
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    expect(b.fetched).toEqual([APPLICATION_URL, reloadUrl, reloadUrl, reloadUrl])
+  })
+})
+
+describe('import error record', () => {
+  it('records the transport failure of a row and clears it once the row imports', async () => {
+    const b = bench([row('a')], { a: () => ({ a: 1 }) }, {
+      transportFailures: { [APPLICATION_URL]: 2, [comboReference(['a'], '0')]: 1 },
+    })
+    await expect(b.loader.import('a', '', {})).rejects.toThrow()
+    expect(b.loader.importError('a')?.message).toContain('could not load "a"')
+    expect(b.loader.importError('a/client')).toBe(b.loader.importError('a'))
+    expect(await b.loader.import('a', '', {})).toEqual({ a: 1 })
+    expect(b.loader.importError('a')).toBeUndefined()
+  })
+
+  it('records a factory that throws during materialization, which no arrival record could see', async () => {
+    const b = bench([row('a')], { a: () => { throw new Error('factory exploded') } })
+    await expect(b.loader.import('a', '', {})).rejects.toThrow('factory exploded')
+    expect(b.loader.importError('a')?.message).toBe('factory exploded')
+  })
+
+  it('names the failed dependency in the consumer\'s record so a cascade reads as a chain', async () => {
+    const b = bench([row('dep'), row('consumer', { inject: ['dep'] })], { dep: () => ({}), consumer: () => ({}) }, {
+      registerOnly: { [APPLICATION_URL]: ['consumer'] },
+      transportFailures: { [comboReference(['dep'], '0')]: 1 },
+    })
+    await expect(b.loader.import('consumer', '', {})).rejects.toThrow(
+      '"consumer" not loaded because dependency "dep" failed: client-modules: could not load "dep"',
+    )
+    expect(b.loader.importError('consumer')?.message).toContain('dependency "dep" failed')
+    expect(b.loader.importError('dep')).toBeUndefined()
+    expect(b.loader.importError('consumer')?.cause).toBeInstanceOf(Error)
+  })
+
+  it('records a non-Error thrown by a factory as an Error carrying its text', async () => {
+    const b = bench([row('a')], { a: () => { throw 'factory rejected a string' } })
+    await expect(b.loader.import('a', '', {})).rejects.toBe('factory rejected a string')
+    expect(b.loader.importError('a')).toBeInstanceOf(Error)
+    expect(b.loader.importError('a')?.message).toBe('factory rejected a string')
+  })
+
+  it('records a prefetch failure and invalidate clears the record', async () => {
+    const b = bench([row('a')], { a: null })
+    await expect(b.loader.prefetch('a')).rejects.toThrow('without registering "a"')
+    expect(b.loader.importError('a')).toBeDefined()
+    b.loader.invalidate('a')
+    expect(b.loader.importError('a')).toBeUndefined()
+  })
+
+  it('has no record for a row that never failed or is unknown', () => {
+    const b = bench([row('a')], { a: () => ({}) })
+    expect(b.loader.importError('a')).toBeUndefined()
+    expect(b.loader.importError('nope')).toBeUndefined()
+  })
+})
+
 describe('require resolution', () => {
   it('a factory requiring a registered-but-unmaterialized module materializes it recursively', async () => {
     const order: string[] = []
@@ -555,6 +695,24 @@ describe('boot manifest wire', () => {
       .toThrow('client-modules: boot manifest batches must be an array')
   })
 
+  it('carries an optional Host release and rejects a malformed one', () => {
+    const wire = { rev: 'graph', entries: [], batches: [] }
+    expect(parseBootManifest(wire)).not.toHaveProperty('release')
+    expect(parseBootManifest({ ...wire, release: { version: '1.0.0' } }).release).toEqual({ version: '1.0.0' })
+    // Members outside the identity are dropped so equality compares only version and commit.
+    expect(parseBootManifest({ ...wire, release: { version: '1.0.0', commit: 'abc1234', label: 'x' } }).release)
+      .toEqual({ version: '1.0.0', commit: 'abc1234' })
+    for (const release of ['1.0.0', null, {}, { version: 1 }, { version: '1.0.0', commit: 7 }]) {
+      expect(() => parseBootManifest({ ...wire, release }))
+        .toThrow('client-modules: boot manifest release must carry a string version and an optional string commit')
+      // Release comparison reads no further than the release and reports an unreadable one as absent.
+      expect(readRelease({ release })).toBeUndefined()
+    }
+    expect(readRelease({ release: { version: '1.0.0', commit: 'abc1234', label: 'x' }, entries: 'another format' }))
+      .toEqual({ version: '1.0.0', commit: 'abc1234' })
+    expect(readRelease(null)).toBeUndefined()
+  })
+
   it('rejects malformed batch phases', () => {
     const entry = { id: 'a', url: '/a.js', rev: '1' }
     expect(() => parseBootManifest({ rev: 'graph', entries: [entry], batches: [null] }))
@@ -691,6 +849,37 @@ describe('style claiming', () => {
     expect(b.loader.loadCache.get('a')?.styles).toEqual(['a', 'sheet-1'])
     expect(document.querySelectorAll('style[data-plugin="a"]')).toHaveLength(2)
     expect(foreign.getAttribute('data-plugin')).toBe('other')
+  })
+
+  it('leaves untagged style tags inserted before materialization unclaimed', async () => {
+    const earlier = document.createElement('style')
+    document.head.appendChild(earlier)
+    const b = bench([row('a')], { a: () => ({}) })
+    await b.loader.import('a', '', {})
+    removeOwnedStyles('a')
+    expect(earlier.isConnected).toBe(true)
+    expect(earlier.hasAttribute('data-plugin')).toBe(false)
+  })
+
+  it('assigns an untagged style to the factory that inserted it before a nested require', async () => {
+    const outer = document.createElement('style')
+    const b = bench([row('b'), row('a', { external: ['b'] })], {
+      a: (require) => {
+        document.head.appendChild(outer)
+        require('b')
+        return {}
+      },
+      b: () => ({}),
+    })
+    await b.loader.import('a', '', {})
+    expect(outer.getAttribute('data-plugin')).toBe('a')
+  })
+
+  it('removes untagged styles inserted by a factory that throws', async () => {
+    const leaked = document.createElement('style')
+    const b = bench([row('a')], { a: () => { document.head.appendChild(leaked); throw new Error('factory exploded') } })
+    await expect(b.loader.import('a', '', {})).rejects.toThrow('factory exploded')
+    expect(leaked.isConnected).toBe(false)
   })
 
   it('materialization without a document skips the style inventory', async () => {

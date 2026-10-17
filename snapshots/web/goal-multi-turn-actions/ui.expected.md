@@ -14,15 +14,19 @@
 - button "Continuing goal {{clock}}":
   - text: Continuing goal
   - time: {{clock}}
-- status: Worked
-- button "Took {{duration}}"
+- status: Completed
+- button "Completed in {{duration}}"
 - paragraph:
   - strong: Turn 1 / 2
   - text: — 随机选中的包：
   - code: packages/context/session-reference
   - text: 📦
+- text: Code block
+- button "Wrap lines" [pressed]
 - button "Copy"
 - code: session-reference ├── README.md ├── package.json ├── src │ ├── index.ts │ └── uri.ts └── tests └── session-reference.spec.ts
+- text: Code block
+- button "Wrap lines" [pressed]
 - button "Copy"
 - code: "session-reference/ ├── README.md # 包说明文档 ├── package.json # 包元数据与依赖声明 ├── src/ │ ├── index.ts # 入口，导出公共 API │ └── uri.ts # 会话引用 URI 相关实现 └── tests/ └── session-reference.spec.ts # 单元测试"
 - paragraph: 这是一个很典型的轻量 TypeScript 包结构：入口 + 实现 + 测试。这一轮到此结束，等系统开启下一个 turn。
@@ -34,8 +38,8 @@
 - button "Continuing goal {{clock}}":
   - text: Continuing goal
   - time: {{clock}}
-- status: Worked
-- button "Took {{duration}}"
+- status: Completed
+- button "Completed in {{duration}}"
 - paragraph: 两个 turn 都完成了 ✅
 - paragraph:
   - strong: 总结：
@@ -44,14 +48,16 @@
     - strong: Turn 1
     - text: — 随机选中
     - code: packages/context/session-reference
-    - text: ，输出了文件结构：
+    - text: ，输出了文件结构： Code block
+    - button "Wrap lines" [pressed]
     - button "Copy"
     - code: session-reference/ ├── README.md ├── package.json ├── src/ │ ├── index.ts │ └── uri.ts └── tests/ └── session-reference.spec.ts
   - listitem:
     - strong: Turn 2
     - text: — 随机选中
     - code: packages/llm/token-meter
-    - text: ，输出了文件结构：
+    - text: ，输出了文件结构： Code block
+    - button "Wrap lines" [pressed]
     - button "Copy"
     - code: token-meter/ ├── README.md ├── package.json ├── src/ │ └── index.ts └── tests/ └── token-meter.spec.ts
 - paragraph:
@@ -88,7 +94,6 @@
 - button "Good response"
 - button "Bad response"
 - button "Branch into a new conversation"
-- tooltip "Branch into a new conversation"
 - text: {{clock}}
 - textbox "Message or run a task, / commands, @ files or sessions"
 - button "Add files or run commands"

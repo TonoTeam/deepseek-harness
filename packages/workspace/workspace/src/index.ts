@@ -176,15 +176,17 @@ export class WorkspaceRegistry extends Service {
   private readonly entities = new Map<WorkspaceId, WorkspaceEntity>()
   private readonly headers = new Map<SessionId, SessionHeader>()
   private readonly sessionPaths = new Map<SessionId, string>()
+  private readonly missingSessionPaths = new Set<SessionId>()
   private readonly invalidSessionPaths = new Map<SessionId, string>()
   private operationTail: Promise<void> = Promise.resolve()
 
   private readonly host: WorkspaceEntityHost = {
     table: () => this.requireTable(),
-    sessionPath: id => this.sessionPaths.get(id),
+    candidateMatches: (id, path) => this.sessionPaths.get(id) === path || this.missingSessionPaths.has(id),
     readSessionHeader: id => this.readSessionHeader(id),
     rememberSessionPath: (id, path) => {
       this.sessionPaths.set(id, path)
+      this.missingSessionPaths.delete(id)
       this.invalidSessionPaths.delete(id)
     },
   }
@@ -245,13 +247,15 @@ export class WorkspaceRegistry extends Service {
    * Initialize the default Workspace only while both the registry and Session
    * history are empty. Repeated requests reuse its durable identity; deleting
    * that registration permanently disables automatic creation.
-   * @param resolveDirectory - resolve the absolute directory and initial title;
-   * called only for eligible creation, inside the registry mutation queue.
-   * Missing directories are created recursively before registration.
+   * @param resolveDirectory - resolve the absolute directory; called only for
+   * eligible creation, inside the registry mutation queue. Missing directories
+   * are created recursively before registration, and the initial title is the
+   * requested directory's own final segment — not the canonical one, so a
+   * symlink at that path does not retitle the Workspace after its target.
    * After resolution, caller cancellation does not roll back creation or registration.
    * @returns the initialized Workspace, or undefined when automatic creation is ineligible.
    */
-  initializeDefault(resolveDirectory: () => Promise<{ path: string; title: string }>): Promise<Workspace | undefined> {
+  initializeDefault(resolveDirectory: () => Promise<string>): Promise<Workspace | undefined> {
     return this.enqueueOperation(async () => {
       const state = this.requireState()
       if (state.defaultWorkspaceId !== undefined) return this.entities.get(state.defaultWorkspaceId)
@@ -260,13 +264,13 @@ export class WorkspaceRegistry extends Service {
       if (state.workspaceIds.length > 0 || state.archivedSessionIds.length > 0
         || sessions.list().length > 0 || (await this.listStoredHeaders()).length > 0) return undefined
 
-      const { path, title } = await resolveDirectory()
+      const path = await resolveDirectory()
       if (!fullyQualifiedWorkspacePath(path)) throw new TypeError(`Workspace path is not fully qualified: '${path}'`)
       await mkdir(path, { recursive: true })
       const canonical = await realpathNormalize(path)
       // A Session can start outside the registry queue while directory preparation awaits I/O.
       if ((await this.listStoredHeaders()).length > 0 || sessions.list().length > 0) return undefined
-      return this.createCanonical(canonical, title, true)
+      return this.createCanonical(canonical, defaultWorkspaceTitle(path), true)
     })
   }
 
@@ -791,6 +795,7 @@ export class WorkspaceRegistry extends Service {
   private async replaceHeaderIndex(headers: readonly SessionHeader[]): Promise<void> {
     this.headers.clear()
     this.sessionPaths.clear()
+    this.missingSessionPaths.clear()
     this.invalidSessionPaths.clear()
     await this.indexHeaders(headers)
   }
@@ -802,6 +807,7 @@ export class WorkspaceRegistry extends Service {
   private async indexHeader(header: SessionHeader): Promise<void> {
     this.headers.set(header.id, header)
     this.sessionPaths.delete(header.id)
+    this.missingSessionPaths.delete(header.id)
     if (header.cwd === undefined) {
       this.invalidSessionPaths.set(header.id, 'header has no cwd')
       return
@@ -814,7 +820,11 @@ export class WorkspaceRegistry extends Service {
       }
       this.sessionPaths.set(header.id, path)
       this.invalidSessionPaths.delete(header.id)
-    } catch {
+    } catch (error) {
+      if (fullyQualifiedWorkspacePath(header.cwd)
+        && error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        this.missingSessionPaths.add(header.id)
+      }
       this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' does not resolve`)
     }
   }
@@ -835,8 +845,8 @@ export class WorkspaceRegistry extends Service {
     for (const entity of this.entities.values()) {
       const record = this.requireTable().get(entity.id) as WorkspaceRecord
       for (const sessionId of record.sessionIds) {
+        if (this.host.candidateMatches(sessionId, record.path)) continue
         const path = this.sessionPaths.get(sessionId)
-        if (path === record.path) continue
         const reason = this.invalidSessionPaths.get(sessionId)
           ?? (this.headers.has(sessionId)
             ? `canonical cwd '${path}' differs from workspace path '${record.path}'`

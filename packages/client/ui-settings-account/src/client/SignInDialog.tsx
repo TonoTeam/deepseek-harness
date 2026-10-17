@@ -4,11 +4,14 @@ import { Button, IconCloseOutlineRegular, IconLoadingOutlineRegular, Modal } fro
 import type { AccountSnapshot } from './AccountSection.tsx'
 import type { SignInAttemptId } from '@deepseek-ai/dsh-deepseek-account/types'
 import type { AccountKey } from './locales.ts'
+import { authorizeUrlWithTheme } from './authorize-url.ts'
 import css from './SignInDialog.module.css'
 
 /** @param props - safe account state, localized copy, and user actions. @returns login dialog. */
-export function SignInDialog({ account, start, cancel, close, useApiKey, t }: {
+export function SignInDialog({ account, colorScheme, start, cancel, close, useApiKey, t }: {
   account: AccountSnapshot
+  /** Resolved scheme of the active application theme; the copied link carries it. */
+  colorScheme: 'light' | 'dark'
   start: () => Promise<void>
   cancel: (id: SignInAttemptId) => Promise<void>
   close: () => void
@@ -29,7 +32,10 @@ export function SignInDialog({ account, start, cancel, close, useApiKey, t }: {
   const phase = attempt?.phase
   const active = busy || phase === 'initializing' || phase === 'waiting-browser' || phase === 'exchanging' || phase === 'committing'
   const expired = phase === 'expired'
-  const error = failed || account.loginFailed || account.failed || phase === 'failed'
+  const localFailure = failed || account.loginFailed || account.failed
+  const error = localFailure || phase === 'failed'
+  const failureKey = !localFailure
+    && phase === 'failed' && attempt?.errorCode === 'no-response' ? 'noResponse' : 'failed'
   const waiting = active && !error
   const committing = phase === 'committing'
   useEffect(() => { if (account.view?.status === 'credential-stored') close() }, [account.view?.status, close])
@@ -49,7 +55,7 @@ export function SignInDialog({ account, start, cancel, close, useApiKey, t }: {
   }
   const copyLink = async (authorizeUrl: string) => {
     try {
-      await navigator.clipboard.writeText(authorizeUrl)
+      await navigator.clipboard.writeText(authorizeUrlWithTheme(authorizeUrl, colorScheme))
       setCopyResult({ messageKey: 'copiedLink' })
     } catch { setCopyResult({ messageKey: 'copyFailed' }) }
   }
@@ -68,7 +74,7 @@ export function SignInDialog({ account, start, cancel, close, useApiKey, t }: {
           {t(copyResult?.messageKey ?? 'copyLink')}
         </button>{t('browserDescription')}
       </p> : <p className={css.description}>
-        {error ? t('failed') : expired ? t('timeoutDescription') : t('loginDescription')}
+        {error ? t(failureKey) : expired ? t('timeoutDescription') : t('loginDescription')}
       </p>}
     </div>
     <div className={css.actions}>

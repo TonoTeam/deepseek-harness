@@ -27,7 +27,7 @@ afterEach(() => { vi.unstubAllGlobals() })
 // so browser-language detection never runs and a fresh LocaleRuntime opens on
 // FALLBACK_LOCALE (en); bench stages zh explicitly on the locale instead.
 
-async function bench(isLoopback = true, mock = RemoteMock.create().load(remoteDefaultResponses), services: object = {}) {
+async function bench(mock = RemoteMock.create().load(remoteDefaultResponses), services: object = {}) {
   onTestFinished(() => { mock.assertNoUnmatched() })
   const ctx = new Context()
   await ctx.plugin(SlotRegistry).await()
@@ -47,9 +47,8 @@ async function bench(isLoopback = true, mock = RemoteMock.create().load(remoteDe
       ...services,
     },
     settings: mock.remote.settings,
+    session: { initializeDefaultModel: vi.fn(async () => ({ ok: true, value: undefined })) },
   })
-  // The fixed Host facts the settings provider reads its persistence from.
-  remote.$host = { home: undefined, isLoopback }
   await ctx.plugin({ inject: [...settingsInject], apply: settingsApply }).await()
   return { ctx, slots: ctx.get('slots') as SlotRegistry, locale, remote }
 }
@@ -109,7 +108,7 @@ describe('ui-settings-models apply', () => {
 
   it('declares the services it uses', () => {
     expect(inject).toEqual([
-      'slots', 'locale', 'remote', 'remote.credentials', 'remote.llm', 'remote.settings',
+      'slots', 'locale', 'remote', 'remote.credentials', 'remote.llm', 'remote.settings', 'remote.session',
       'configForms', 'settingsSchema',
     ])
   })
@@ -140,6 +139,12 @@ describe('ui-settings-models apply', () => {
     })
     const deepSeek = onboarding.find(entry => entry.options.id === 'deepseek-official')!
     expect(deepSeek.component).toBe(DeepSeekOnboardingDialog)
+    const analytics = (deepSeek.inject!() as object) as import('../src/client/DeepSeekOnboardingDialog.tsx').DeepSeekOnboardingInjected
+    analytics.track?.('api_key_save_click', {})
+    const track = vi.fn()
+    before.ctx.provide('productAnalytics', { track } as never)
+    analytics.track?.('api_key_save_click', {})
+    expect(track).toHaveBeenCalledWith('api_key_save_click', {})
     expect(deepSeek.options).toMatchObject({ id: 'deepseek-official', order: 0 })
     const deepSeekInjected = (
       deepSeek.inject as unknown as () => import('../src/client/DeepSeekOnboardingDialog.tsx').DeepSeekOnboardingInjected
@@ -235,22 +240,6 @@ describe('ui-settings-models apply', () => {
     expect(() => b.locale.register('settings.models', 'zh', {})).not.toThrow()
     expect(() => b.locale.register('settings.models', 'en', {})).not.toThrow()
   })
-
-  it('keeps remote-browser acknowledgement in process memory', async () => {
-    const b = await bench(false)
-    declare(b.slots)
-    await b.ctx.plugin({ inject: [...inject], apply }).await()
-    const entry = b.slots.entries('settings.onboarding')
-      .find(candidate => candidate.options.id === 'welcome-notice')!
-    const injected = (
-      entry.inject as unknown as () => import('../src/client/WelcomeNotice.tsx').WelcomeNoticeInjected
-    )()
-
-    await injected.controller.load()
-    expect(injected.controller.store.getSnapshot()).toEqual({
-      status: 'ready', acknowledged: false, error: null,
-    })
-  })
 })
 
 describe('pushed invalidations', () => {
@@ -311,7 +300,7 @@ describe('pushed invalidations', () => {
     }
     const document = { writable: true, hasDocument: false, namespaces: [namespace] }
     mock.remote.settings.describe.mockResolvedValue(ok(document))
-    const b = await bench(true, mock)
+    const b = await bench(mock)
     declare(b.slots)
     await b.ctx.plugin({ inject: [...inject], apply }).await()
     const entry = b.slots.entries('settings.onboarding')
@@ -341,7 +330,7 @@ describe('pushed invalidations', () => {
     const describe = mock.remote.settings.describe
     describe.mockResolvedValue(ok(document))
     const listProviders = vi.fn(() => Promise.resolve({ ok: true as const, value: [] }))
-    const b = await bench(true, mock, { listProviders })
+    const b = await bench(mock, { listProviders })
     declare(b.slots)
     await b.ctx.plugin({ inject: [...inject], apply }).await()
     const entry = b.slots.entries('settings.section')
