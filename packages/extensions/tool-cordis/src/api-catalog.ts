@@ -2169,6 +2169,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'acknowledgement that cancellation was requested.',
       },
       {
+        signature: '@Remote(\'head\') head(request: SessionHeadRequest): SessionHeadValue',
+        description: 'Read the current log cut of one resident Session without loading or promoting it.',
+        parameters: [{ name: 'request', description: 'exact Session identity.' }],
+        returns: 'attached instance identity and inclusive log cut, or resident false.',
+      },
+      {
         signature: '@Remote({ name: \'page\', resources: { session: addressedSession } }) page(request: SessionPageRequest, signal: AbortSignal): Promise<SessionPage>',
         description: 'Read one cold-safe, message-aligned Session history page.',
         parameters: [{ name: 'request', description: 'durable address, backward cursor, and page budget.' }, { name: 'signal', description: 'cancellation for persistence reads.' }],
@@ -7208,6 +7214,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionHeader',
     declaration: 'export interface SessionHeader {\n    readonly version: typeof SESSION_FORMAT_VERSION;\n    readonly id: SessionId;\n    readonly createdAt: number;\n    readonly cwd?: string;\n    readonly parentSession?: SessionId;\n    readonly isSeeded: boolean;\n    readonly origin?: \'subagent\';\n    readonly delegationDepth?: number;\n    readonly agentPreset?: string;\n}',
+  },
+  {
+    name: 'SessionHeadRequest',
+    declaration: 'export interface SessionHeadRequest {\n    readonly address: {\n        readonly kind: \'session\';\n        readonly sessionId: SessionId;\n    };\n}',
+  },
+  {
+    name: 'SessionHeadValue',
+    declaration: 'export type SessionHeadValue = {\n    readonly resident: false;\n} | {\n    readonly resident: true;\n    readonly residentId: string;\n    readonly header: Pick<SessionWireHeader, \'version\' | \'id\' | \'createdAt\' | \'isSeeded\'>;\n    readonly throughSeq: number;\n};',
   },
   {
     name: 'SessionHistoryRecord',

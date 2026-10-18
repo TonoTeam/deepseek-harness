@@ -79,6 +79,7 @@ export class SessionHistoryController {
    * @returns unavailable for nonresident Sessions, otherwise identity and inclusive log cut.
    */
   head(request: SessionHeadRequest): SessionHeadValue {
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- Gateway JSON still needs runtime identity validation.
     if (request.address.kind !== 'session'
       || typeof request.address.sessionId !== 'string'
       || request.address.sessionId.length === 0) {
