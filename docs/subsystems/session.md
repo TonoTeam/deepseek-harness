@@ -959,6 +959,13 @@ workspaceDesktop(): { name: string; available: boolean; fileManager: 'finder' | 
 @Remote('cancel') cancel(request: SessionCancelRequest): SessionCancelValue
 
 /**
+ * Read the current log cut of one resident Session without loading or promoting it.
+ * @param request - exact Session identity.
+ * @returns attached instance identity and inclusive log cut, or resident false.
+ */
+@Remote('head') head(request: SessionHeadRequest): SessionHeadValue
+
+/**
  * Read one cold-safe, message-aligned Session history page.
  * @param request - durable address, backward cursor, and page budget.
  * @param signal - cancellation for persistence reads.
