@@ -135,8 +135,11 @@ describe('SessionController facade', () => {
       done: false,
       value: { type: 'snapshot', cursor: 2 },
     })
+    // An open follower pins the exact live Agent for its whole generator life.
+    expect(ctx.agents.retention(agent)?.leases).toBe(1)
     abort.abort()
     await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined })
+    expect(ctx.agents.retention(agent)?.leases).toBe(0)
   })
 
   it.each(['success', 'domain-error', 'throw'] as const)(
@@ -196,6 +199,98 @@ describe('SessionController facade', () => {
       await ctx.fiber.dispose()
     },
   )
+
+  it('leases a promoted cold follow until the follower generator closes', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(AgentRegistry)
+    const sessionId = SessionId('background-lease')
+    const header: SessionHeader = {
+      version: SESSION_FORMAT_VERSION, id: sessionId, createdAt: 1, cwd: '/workspace', isSeeded: false,
+    }
+    ctx.provide('sessionPersistence', testSessionPersistence(ctx, {
+      list: () => Promise.resolve([header]),
+      inspect: () => Promise.resolve({
+        meta: header,
+        inheritedEventCount: SessionLogOffset(0),
+        events: [],
+      }),
+    }) as never)
+    const controller = createSessionTestController(ctx, defaults)
+    const agents = (controller as unknown as { agents: ApiSessionAgentController }).agents
+    let live: Agent | undefined
+    vi.spyOn(agents, 'resolveObservedAgent').mockImplementation(async () => {
+      const session = ctx.sessions.create(sessionId, { meta: header })
+      live = { id: sessionId, session, ctx, status: 'idle' } as unknown as Agent
+      await ctx.agents.register(live)
+      return { agent: live }
+    })
+    const abort = new AbortController()
+    const iterator = controller.follow({
+      address: { kind: 'session', sessionId },
+    }, abort.signal)[Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'snapshot' } })
+    const waiting = iterator.next()
+    await vi.waitFor(() => {
+      if (live === undefined) throw new Error('promotion did not publish a live Agent')
+      expect(ctx.agents.retention(live)?.leases).toBe(1)
+    })
+    abort.abort()
+    await expect(waiting).resolves.toMatchObject({ done: true })
+    if (live === undefined) throw new Error('promotion did not publish a live Agent')
+    expect(ctx.agents.retention(live)?.leases).toBe(0)
+    await ctx.fiber.dispose()
+  })
+
+  it('releases a cold follow promotion that settles after the follower closes early', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(AgentRegistry)
+    const sessionId = SessionId('background-early-close')
+    const header: SessionHeader = {
+      version: SESSION_FORMAT_VERSION, id: sessionId, createdAt: 1, cwd: '/workspace', isSeeded: false,
+    }
+    ctx.provide('sessionPersistence', testSessionPersistence(ctx, {
+      list: () => Promise.resolve([header]),
+      inspect: () => Promise.resolve({
+        meta: header,
+        inheritedEventCount: SessionLogOffset(0),
+        events: [],
+      }),
+    }) as never)
+    const controller = createSessionTestController(ctx, defaults)
+    const agents = (controller as unknown as { agents: ApiSessionAgentController }).agents
+    const started = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    let live: Agent | undefined
+    vi.spyOn(agents, 'resolveObservedAgent').mockImplementation(async () => {
+      started.resolve(undefined)
+      await release.promise
+      const session = ctx.sessions.create(sessionId, { meta: header })
+      live = { id: sessionId, session, ctx, status: 'idle' } as unknown as Agent
+      await ctx.agents.register(live)
+      return { agent: live }
+    })
+    const abort = new AbortController()
+    const iterator = controller.follow({
+      address: { kind: 'session', sessionId },
+    }, abort.signal)[Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'snapshot' } })
+    const waiting = iterator.next()
+    await started.promise
+    abort.abort()
+    await expect(waiting).resolves.toMatchObject({ done: true })
+    // The follower is gone, but activation still owns a lease for an instant;
+    // settlement must release it instead of leaking a pinned Agent.
+    release.resolve(undefined)
+    await vi.waitFor(() => {
+      if (live === undefined) throw new Error('promotion did not publish a live Agent')
+      expect(ctx.agents.retention(live)?.leases).toBe(0)
+    })
+    await ctx.fiber.dispose()
+  })
 
   it('waits for an admitted background promotion during teardown', async () => {
     const ctx = new Context()

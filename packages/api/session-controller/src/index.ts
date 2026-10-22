@@ -2,7 +2,7 @@
 
 import { hostname } from 'node:os'
 import { resolve } from 'node:path'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-fs'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -19,7 +19,9 @@ import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-api-remote-access'
 import {
   ApiSessionAgentController,
+  DEFAULT_API_IDLE_EVICTION,
   inspectApiSession,
+  type ApiIdleEvictionConfig,
   type ApiSessionAgentResult,
 } from './agent.ts'
 import { SessionCommandController, hasPromptContent } from './commands.ts'
@@ -92,16 +94,35 @@ function addressedSession(request: { readonly address: SessionAddress }): Sessio
   return request.address.kind === 'session' ? request.address.sessionId : request.address.childSessionId
 }
 
+/** Opt-in idle reclamation deployment policy; omitted or disabled keeps it off. */
+export interface IdleEvictionDeploymentConfig {
+  /** Whether bounded idle sweeps run. */
+  readonly enabled?: boolean
+  /** Real quiescence time before an Agent is a reclaim candidate. */
+  readonly idleTtlMs?: number
+  /** Delay between bounded, non-overlapping sweeps. */
+  readonly sweepPeriodMs?: number
+  /** Maximum candidates examined by one sweep. */
+  readonly maxPerSweep?: number
+  /** Maximum time the read-only activity proof may keep admission sealed. */
+  readonly reclaimTimeoutMs?: number
+}
+
 /** Session Controller deployment policy. */
 export interface Config {
   /** Override platform desktop-opener detection. */
   readonly nativeOpen?: boolean
   /** Positive integral milliseconds of list work before yielding between complete rows. */
   readonly listWorkSliceMs?: number
+  /** Opt-in safe idle Agent reclamation; disabled by default. */
+  readonly idleEviction?: IdleEvictionDeploymentConfig
 }
 
 /** Deployment policy after schema defaults have been applied. */
-type ResolvedConfig = Config & { readonly listWorkSliceMs: number }
+type ResolvedConfig = Config & {
+  readonly listWorkSliceMs: number
+  readonly idleEviction: ApiIdleEvictionConfig
+}
 
 /** Host integrations replaceable by direct unit tests. */
 export interface SessionControllerInternals {
@@ -137,6 +158,13 @@ export class SessionController extends TypertRemoteService {
   static Config: z<Config, ResolvedConfig> = z.object({
     nativeOpen: z.boolean(),
     listWorkSliceMs: z.natural().min(1).default(16),
+    idleEviction: z.object({
+      enabled: z.boolean().default(DEFAULT_API_IDLE_EVICTION.enabled),
+      idleTtlMs: z.natural().min(1).default(DEFAULT_API_IDLE_EVICTION.idleTtlMs),
+      sweepPeriodMs: z.natural().min(1).default(DEFAULT_API_IDLE_EVICTION.sweepPeriodMs),
+      maxPerSweep: z.natural().min(1).default(DEFAULT_API_IDLE_EVICTION.maxPerSweep),
+      reclaimTimeoutMs: z.natural().min(1).default(DEFAULT_API_IDLE_EVICTION.reclaimTimeoutMs),
+    }).default({ ...DEFAULT_API_IDLE_EVICTION }),
   })
 
   private readonly agents: ApiSessionAgentController
@@ -149,7 +177,7 @@ export class SessionController extends TypertRemoteService {
   private readonly openFileApplication: typeof openNativeFileApplication
   private readonly revealPath: (path: string, signal: AbortSignal) => Promise<void>
   private readonly canOpenPath: () => boolean
-  private readonly promotions = new Set<Promise<void>>()
+  private readonly promotions = new Set<Promise<AgentActivityLease | undefined>>()
 
   /**
    * @param ctx - Host context containing the Session capability assembly.
@@ -161,12 +189,17 @@ export class SessionController extends TypertRemoteService {
     ctx.typert.resources.register('session', { field: 'sessionId' })
     const resolved = SessionController.Config(config)
     installModelSelectionProjection(ctx)
-    this.agents = new ApiSessionAgentController(ctx)
+    this.agents = new ApiSessionAgentController(ctx, resolved.idleEviction)
     this.commands = new SessionCommandController(ctx, this.agents, process.cwd())
     ctx.effect(() => ctx.fileUploads.registerAgentResolver(async (sessionId) => {
       const result = await this.agents.resolveAgent(sessionId)
       if ('error' in result) throw result.error
       return result.agent
+    }, async (sessionId) => {
+      // The HTTP upload bypasses the Gateway, so this optional borrower is its
+      // exact lease for the real storage stream.
+      const acquired = await this.agents.acquireRetained(sessionId)
+      return { value: acquired.agent, release: () => { acquired.lease.release() } }
     }), 'session-controller: file-upload Agent resolver')
     this.controlState = new SessionControlController(ctx)
     // Registered before history so reverse-order teardown closes every
@@ -174,7 +207,7 @@ export class SessionController extends TypertRemoteService {
     ctx.effect(() => async () => {
       await Promise.allSettled([...this.promotions])
     }, 'session-controller.promotions')
-    this.history = new SessionHistoryController(ctx, (observation) => { this.promote(observation) })
+    this.history = new SessionHistoryController(ctx, observation => this.promote(observation))
     this.listState = new ApiSessionList(ctx, resolved.listWorkSliceMs)
     this.fileApplications = internals.fileApplications ?? nativeFileApplications
     this.openFileApplication = internals.openFileApplication ?? openNativeFileApplication
@@ -224,17 +257,25 @@ export class SessionController extends TypertRemoteService {
     })
   }
 
-  private promote(observation: SessionObservation): void {
+  private promote(observation: SessionObservation): Promise<AgentActivityLease | undefined> {
     const sessionId = observation.header.id
-    const task = (async () => {
+    const task = (async (): Promise<AgentActivityLease | undefined> => {
       using ownedObservation = observation
       const result = await this.agents.resolveObservedAgent(ownedObservation)
-      if ('error' in result) this.ctx.emit('api-session/error', sessionId, result.error.message)
+      if ('error' in result) {
+        this.ctx.emit('api-session/error', sessionId, result.error.message)
+        return undefined
+      }
+      // Acquire before any later timer tick: a cold follow keeps its promoted
+      // Agent resident until the generator's own cleanup releases this lease.
+      return this.agents.retainLive(sessionId)
     })().catch((error: unknown) => {
       this.ctx.logger.error(`session-controller: background activation for "${sessionId}" failed: ${errorChain(error)}`)
+      return undefined
     })
     this.promotions.add(task)
     void task.finally(() => { this.promotions.delete(task) })
+    return task
   }
 
   /**
@@ -311,7 +352,9 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('selectModel')
   selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue> {
-    return this.commands.selectModel(request)
+    // Model resolution and any asynchronous provider work stay pinned to the
+    // exact Agent; the Gateway borrow covers other packages' Remote methods.
+    return this.agents.withRetainedAgent(request.sessionId, () => this.commands.selectModel(request))
   }
 
   /**
@@ -484,7 +527,7 @@ export class SessionController extends TypertRemoteService {
       ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
       ...(principal === undefined ? {} : { principal }),
     }
-    return this.commands.prompt(request, source)
+    return this.agents.withRetainedAgent(request.sessionId, () => this.commands.prompt(request, source))
   }
 
   /**
@@ -547,7 +590,24 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote({ mode: 'stream', resources: { session: addressedSession } })
   follow(request: SessionFollowRequest, signal: AbortSignal): AsyncIterable<SessionFollowFrame> {
-    return this.history.follow(request, signal)
+    return this.followPinned(request, signal)
+  }
+
+  /**
+   * Pin a live Agent for the full follower generator lifetime. Cold Sessions
+   * acquire nothing and keep their existing promotion semantics; the lease is
+   * released only after the follower's final cleanup, including early close.
+   */
+  private async *followPinned(
+    request: SessionFollowRequest,
+    signal: AbortSignal,
+  ): AsyncIterable<SessionFollowFrame> {
+    const lease = this.agents.retainLive(addressedSession(request))
+    try {
+      yield* this.history.follow(request, signal)
+    } finally {
+      lease?.release()
+    }
   }
 
   /**

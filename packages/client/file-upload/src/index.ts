@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import type { CommandFileReceiptResolver } from '@deepseek-ai/dsh-commands'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import type { TypertBorrowedValue } from '@deepseek-ai/dsh-typert-protocol'
 import { handleFileUploadHttp } from './http-route.ts'
 import { FILE_UPLOAD_PATH } from './protocol.ts'
 import type { EncodedFileUploadRequest, FileUploadReceiptId, FileUploadValue } from './types.ts'
@@ -25,10 +26,19 @@ interface StagedFileUpload {
   readonly file: FileAttachmentRef
   /** Prompt that accepted this receipt; absent until successful admission. */
   requestId?: string
+  /** Exact-Agent lease that keeps this staged receipt's owner resident. */
+  readonly release: () => void
 }
 
 /** Resolve or resume the ordinary Agent that owns one Session identity. */
 export type AgentResolver = (sessionId: SessionId) => Promise<Agent>
+
+/**
+ * Optional acquisition that returns the exact Agent with a lease. Compositions
+ * with idle reclamation register it beside {@link AgentResolver}; a resolver
+ * without one keeps the legacy non-native integration behavior.
+ */
+export type AgentBorrower = (sessionId: SessionId) => Promise<TypertBorrowedValue<Agent>>
 
 /** Prompt receipt binding that restores its previous owners unless delivery commits it. */
 export interface PromptFileBinding extends Disposable {
@@ -58,6 +68,7 @@ export class FileUploads extends TypertRemoteService {
 
   private readonly stagedFiles = new WeakMap<Session, Map<FileUploadReceiptId, StagedFileUpload>>()
   private agentResolver: AgentResolver | undefined
+  private agentBorrower: AgentBorrower | undefined
 
   /** @param ctx - Host context carrying Agent, attachment, command, and Connection services. */
   constructor(ctx: Context) {
@@ -78,19 +89,25 @@ export class FileUploads extends TypertRemoteService {
       'file-upload: streaming route',
     )
     ctx.on('session/event', (session, event) => { this.observeSessionEvent(session, event) })
-    ctx.on('session/disposed', (session) => { this.stagedFiles.delete(session) })
+    ctx.on('session/disposed', (session) => { this.releaseStaged(session) })
   }
 
   /**
-   * Register the ordinary-Session resolver used when a raw upload addresses a cold Session.
+   * Register the ordinary-Session resolver used when a raw upload addresses a
+   * cold Session, plus the optional exact-Agent borrower for the upload's real
+   * stream lifetime.
    * @param resolve - resolver that returns the exact live Agent or throws a Remote error.
-   * @returns disposer removing this resolver.
+   * @param borrow - optional acquisition holding the Agent's exact usage lease.
+   * @returns disposer removing this registration.
    */
-  registerAgentResolver(resolve: AgentResolver): () => void {
+  registerAgentResolver(resolve: AgentResolver, borrow?: AgentBorrower): () => void {
     if (this.agentResolver !== undefined) throw new Error('file-upload: Agent resolver is already registered')
     this.agentResolver = resolve
+    this.agentBorrower = borrow
     return () => {
-      if (this.agentResolver === resolve) this.agentResolver = undefined
+      if (this.agentResolver !== resolve) return
+      this.agentResolver = undefined
+      this.agentBorrower = undefined
     }
   }
 
@@ -121,12 +138,19 @@ export class FileUploads extends TypertRemoteService {
     readonly signal?: AbortSignal
     readonly name?: string
   }): Promise<FileUploadValue> {
-    const agent = await this.resolveAgent(request.sessionId)
-    return this.commit(agent, async () => this.ctx.attachments.saveFileStream({
-      data: request.data,
-      ...(request.signal === undefined ? {} : { signal: request.signal }),
-      ...(request.name === undefined ? {} : { name: request.name }),
-    }))
+    const borrowed = this.agentBorrower === undefined ? undefined : await this.agentBorrower(request.sessionId)
+    try {
+      const agent = borrowed?.value ?? await this.resolveAgent(request.sessionId)
+      return await this.commit(agent, async () => this.ctx.attachments.saveFileStream({
+        data: request.data,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        ...(request.name === undefined ? {} : { name: request.name }),
+      }))
+    } finally {
+      // The HTTP route has no Gateway lifetime: the exact lease acquired for
+      // this upload ends only after storage consumed the stream or failed.
+      borrowed?.release()
+    }
   }
 
   /**
@@ -199,13 +223,18 @@ export class FileUploads extends TypertRemoteService {
         { sessionId: agent.id },
       )
     }
+    // The receipt is process-local and keyed by the exact Session object, so
+    // the owner stays pinned until prompt admission consumes it or a queue or
+    // history observation retires it. This keeps a long wait before submission
+    // from reclaiming the Agent and dropping an unsubmitted receipt.
+    const lease = this.ctx.agents.retain(agent)
     let staged = this.stagedFiles.get(agent.session)
     if (staged === undefined) {
       staged = new Map()
       this.stagedFiles.set(agent.session, staged)
     }
     const receiptId = randomUUID() as FileUploadReceiptId
-    staged.set(receiptId, { file })
+    staged.set(receiptId, { file, release: () => { lease.release() } })
     return { receiptId, file }
   }
 
@@ -239,9 +268,18 @@ export class FileUploads extends TypertRemoteService {
     const staged = this.stagedFiles.get(session)
     if (staged === undefined) return
     for (const [receiptId, upload] of staged) {
-      if (upload.requestId === requestId) staged.delete(receiptId)
+      if (upload.requestId !== requestId) continue
+      staged.delete(receiptId)
+      upload.release()
     }
     if (staged.size === 0) this.stagedFiles.delete(session)
+  }
+
+  private releaseStaged(session: Session): void {
+    const staged = this.stagedFiles.get(session)
+    if (staged === undefined) return
+    this.stagedFiles.delete(session)
+    for (const upload of staged.values()) upload.release()
   }
 }
 

@@ -10,6 +10,8 @@ import { z } from 'zod'
 import type {
   InvocationDescriptor,
   RemoteAccessResourceKind,
+  TypertBorrowedValue,
+  TypertBorrower,
   TypertClientContextAdapter,
   TypertContextMap,
   TypertContextRegistry,
@@ -242,7 +244,11 @@ class LookupStore {
           TypertLookupHost<TypertLookupMap[K]>,
           TypertLookupWire<TypertLookupMap[K]>
         >,
-      ) => this.configure(ctx, key, resolver),
+        borrow?: TypertBorrower<
+          TypertLookupHost<TypertLookupMap[K]>,
+          TypertLookupWire<TypertLookupMap[K]>
+        >,
+      ) => this.configure(ctx, key, resolver, borrow),
       get: key => this.get(key),
       definitions: () => [...this.definitions.values()],
       keys: () => [...this.providers.keys()],
@@ -255,6 +261,7 @@ class LookupStore {
     if (provider === undefined) return undefined
     const resolver = this.resolvers.get(key)?.provider
     if (resolver === undefined) return provider
+    const configured = resolver.borrow?.bind(resolver)
     return {
       parameter: provider.parameter,
       wire: provider.wire,
@@ -263,6 +270,10 @@ class LookupStore {
       hostTypeSymbol: provider.hostTypeSymbol,
       wireTypeSymbol: provider.wireTypeSymbol,
       resolve: id => resolver.resolve(id),
+      // The configured resolver owns acquisition for this view. Falling back
+      // to the provider's borrower would bypass that resolver and hand out a
+      // different value than compose-time configuration selected.
+      ...configuredBorrow(configured === undefined ? undefined : (id: unknown) => configured(id)),
     }
   }
 
@@ -270,6 +281,7 @@ class LookupStore {
     ctx: Context,
     key: string,
     resolver: TypertLookupResolver<Host, Wire>,
+    borrow?: TypertBorrower<Host, Wire>,
   ): TypertDisposer {
     validateSegment('lookup key', key)
     if (this.resolvers.has(key)) throw new Error(`typert: lookup "${key}" resolver is already configured`)
@@ -277,7 +289,10 @@ class LookupStore {
     // The map erases each merge-declared Wire type; restore it only at the
     // typed configure() boundary so strict function variance remains sound.
     const entry: ProviderEntry<LookupResolverEntry> = {
-      provider: { resolve: async id => resolver(id as Wire) },
+      provider: {
+        resolve: async id => resolver(id as Wire),
+        ...(borrow === undefined ? {} : { borrow: async id => borrow(id as Wire) }),
+      },
       owner,
     }
     const { resolvers, changes } = this
@@ -330,6 +345,20 @@ class LookupStore {
 
 interface LookupResolverEntry {
   resolve(id: unknown): Promise<unknown>
+  borrow?(id: unknown): Promise<{ readonly value: unknown; release(): void }>
+}
+
+/**
+ * Compose the borrower exposed by one configured view. Capturing the function
+ * keeps a provider method's receiver and avoids an unbound reference.
+ * @param configured - composition-owned borrower, when configured.
+ * @returns the borrow member to spread into the composed provider.
+ */
+function configuredBorrow<Value>(
+  configured: ((id: unknown) => TypertBorrowedValue<Value> | Promise<TypertBorrowedValue<Value>>) | undefined,
+): { borrow?: (id: unknown) => TypertBorrowedValue<Value> | Promise<TypertBorrowedValue<Value>> } {
+  if (configured !== undefined) return { borrow: id => configured(id) }
+  return {}
 }
 
 function lookupDefinitionEquals(left: TypertLookupDefinition, right: TypertLookupDefinition): boolean {
@@ -358,7 +387,8 @@ class ContextStore {
       configureHost: <K extends Extract<keyof TypertContextMap, string>>(
         key: K,
         resolver: TypertHostContextResolver<TypertContextWire<TypertContextMap[K]>>,
-      ) => this.configureHost(ctx, key, resolver),
+        borrow?: TypertBorrower<Context, TypertContextWire<TypertContextMap[K]>>,
+      ) => this.configureHost(ctx, key, resolver, borrow),
       registerClient: <K extends Extract<keyof TypertContextMap, string>>(
         key: K,
         adapter: TypertClientContextAdapter<TypertContextWire<TypertContextMap[K]>>,
@@ -374,12 +404,16 @@ class ContextStore {
     if (adapter === undefined) return undefined
     const resolver = this.hostResolvers.get(key)?.provider
     if (resolver === undefined) return adapter
+    const configured = resolver.borrow?.bind(resolver)
     return {
       wire: adapter.wire,
       wireTypeSymbol: adapter.wireTypeSymbol,
       // oxlint-disable-next-line typescript/no-unnecessary-condition -- domain packages merge resource kinds into TypertResourceMap.
       ...adapter.resource === undefined ? {} : { resource: adapter.resource },
       resolve: id => resolver.resolve(id),
+      // A configured resolver owns acquisition for this view; the adapter's
+      // borrower would otherwise bypass it with a different value.
+      ...configuredBorrow(configured === undefined ? undefined : (id: unknown) => configured(id)),
     }
   }
 
@@ -387,11 +421,15 @@ class ContextStore {
     ctx: Context,
     key: string,
     resolver: TypertHostContextResolver<Wire>,
+    borrow?: TypertBorrower<Context, Wire>,
   ): TypertDisposer {
     validateSegment('Context key', key)
     if (this.hostResolvers.has(key)) throw new Error(`typert: host-context "${key}" resolver is already configured`)
     const entry: ProviderEntry<HostContextResolverEntry> = {
-      provider: { resolve: async id => resolver(id as Wire) },
+      provider: {
+        resolve: async id => resolver(id as Wire),
+        ...(borrow === undefined ? {} : { borrow: async id => borrow(id as Wire) }),
+      },
       owner: {},
     }
     const { hostResolvers, changes } = this
@@ -444,6 +482,7 @@ class ContextStore {
 
 interface HostContextResolverEntry {
   resolve(id: unknown): Promise<Context | undefined>
+  borrow?(id: unknown): Promise<{ readonly value: Context; release(): void }>
 }
 
 /** The built-in identity-less resource kind; no declared resource kind may take its name. */

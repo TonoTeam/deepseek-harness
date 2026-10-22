@@ -101,6 +101,13 @@ A successful `selectModel` response acknowledges the Session-local selection wit
 |---|---:|---|
 | `nativeOpen` | platform-detected | Whether Session workspace paths can be handed to a native desktop opener |
 | `listWorkSliceMs` | `16` | Positive integral list-work time slice in milliseconds; checks occur between complete rows |
+| `idleEviction.enabled` | `false` | Opt-in bounded reclamation of creator-owned ordinary API Agents |
+| `idleEviction.idleTtlMs` | `600000` | Real quiescence time before an Agent becomes a reclaim candidate |
+| `idleEviction.sweepPeriodMs` | `60000` | Delay between bounded, non-overlapping sweeps |
+| `idleEviction.maxPerSweep` | `8` | Maximum candidates examined by one sweep |
+| `idleEviction.reclaimTimeoutMs` | `5000` | Maximum time the read-only activity proof may keep admission sealed |
+
+When `idleEviction.enabled` is true, the controller retains each creator-owned ordinary Agent's full `AgentHandle` and periodically reclaims one only after `AgentHandle.reclaim.idleSince()` reports real quiescence older than `idleTtlMs`. Each sweep starts after the last attempted candidate and wraps once, so a permanently blocked candidate cannot starve later ones. The atomic check asks the existing read-only `workspace/session-activity` waterfall inside the seal; any reported activity, error, or unknown family skips the candidate without archiving, stopping, cancelling, or killing work. A failed guard or flush restores the same Agent. A blank Session, or one without a complete closed turn, is never reclaimed because it has no durable recovery point yet. An `AgentReclaimTeardownError` quarantines the Session id: later resolve and named create requests fail instead of automatically replacing the identity, and an operator must intervene. Successful reclamation drops the handle and all policy metadata; shutdown clears the timer and records and aborts any in-flight activity check. Pending requests that meet a sealing or retired instance wait, then retry only Agent acquisition; side effects such as prompts, uploads, and commands are never replayed. Active follows pin a live Agent through the follower generator's cleanup, including a cold follow's promoted Agent once activation publishes it. The HTTP upload path bypasses the Gateway, so the file-upload service acquires the exact-Agent lease through an optional borrower for the real storage stream; every staged receipt then pins its owner until prompt admission consumes it or a queue or history observation retires it.
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-api-session-controller) is the exhaustive source for accepted fields and their JSDoc.
 
