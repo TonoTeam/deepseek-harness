@@ -248,7 +248,7 @@ export class TerminalSessionService extends Service {
   /**
    * Test whether an exact owner has a published session or unpublished spawn.
    * @param owner - exact live owner to inspect.
-   * @returns true across the spawn-to-close interval; failed cleanup stays active until disposal.
+   * @returns true across the spawn-to-close interval; failed cleanup stays active past disposal.
    */
   hasOwnerActivity(owner: Agent): boolean {
     return (this.pendingSpawns.get(owner)?.size ?? 0) > 0
@@ -422,9 +422,11 @@ export class TerminalSessionService extends Service {
     await Promise.all(pending.map(spawn => spawn.settled))
     const failures = pending.flatMap(spawn => spawn.cleanupFailure === undefined ? [] : [spawn.cleanupFailure.error])
     for (const spawn of pending) {
+      // A confirmed rollback leaves no backend resource to protect. An unknown
+      // rollback may still own a live child, so its exact-owner lease stays
+      // pinned after owner or service teardown; an operator resolves it.
+      if (spawn.cleanupFailure !== undefined) continue
       this.removePendingSpawn(spawn)
-      // Teardown abandons an unreported backend resource with its owner/service,
-      // so the lease must converge here rather than outlive the terminal service.
       spawn.lease.release()
     }
     if (failures.length > 0) {
@@ -477,15 +479,15 @@ export class TerminalSessionService extends Service {
       )
     } finally {
       this.reservedNames.delete(owner)
-      this.releaseLeases(owner)
     }
   }
 
   private async disposeAll(): Promise<void> {
     this.disposing = true
-    // Teardown is best-effort: a close failure still clears registries and runs
-    // owner cleanups before the aggregated error propagates, so one stuck
-    // session cannot orphan backends, reservations, or owner detachers.
+    // Teardown is best-effort: a close failure still clears the backend and
+    // owner-cleanup registries before the aggregated error propagates, so one
+    // stuck session cannot orphan backend registrations or owner detachers.
+    // Unknown backend resources stay tracked with their exact-owner leases.
     try {
       await this.abortAndClose(
         undefined,
@@ -495,18 +497,9 @@ export class TerminalSessionService extends Service {
     } finally {
       this.backends.clear()
       this.reservedNames.clear()
-      this.pendingSpawns.clear()
-      this.releaseLeases()
       const cleanups = [...this.ownerCleanups.values()]
       this.ownerCleanups.clear()
       await Promise.all(cleanups.map(cleanup => Promise.resolve(cleanup())))
-    }
-  }
-
-  /** Release reclamation leases for one owner, or every remaining owner during service teardown. */
-  private releaseLeases(owner?: Agent): void {
-    for (const record of this.sessions.values()) {
-      if (owner === undefined || record.owner === owner) record.lease.release()
     }
   }
 

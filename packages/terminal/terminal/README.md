@@ -49,7 +49,7 @@ Once a session exists, consumers can open a session and receive its id and bound
 
 ### Ownership and isolation
 
-Every session is owned by the exact agent that opened it. Operations that name a session are rejected when the caller is not that agent, so the model cannot reach another agent's terminal even if it learns the id. An optional session `name` is owner-local display metadata — labels such as `main` or `gdb` — and is unique only within its owner. The exact owner is also pinned against idle reclamation from before the backend spawns until the session closes successfully; reclamation never signals or closes a session, and a spawn for a sealed owner is rejected before the backend starts.
+Every session is owned by the exact agent that opened it. Operations that name a session are rejected when the caller is not that agent, so the model cannot reach another agent's terminal even if it learns the id. An optional session `name` is owner-local display metadata — labels such as `main` or `gdb` — and is unique only within its owner. The exact owner is also pinned against idle reclamation from before the backend spawns until the session closes successfully; a close or startup rollback the backend cannot confirm keeps that pin through owner or service teardown, because only an operator can resolve the surviving child. Reclamation never signals or closes a session, and a spawn for a sealed owner is rejected before the backend starts.
 
 ### Observable outcomes and failures
 
@@ -78,13 +78,13 @@ The service owns everything except terminal mechanics: session identity, publica
 
 ### Data model and lifecycle
 
-Each published session is a record of its id, owner, optional name, backend type, and backend session, plus the one active send. Unpublished spawns are tracked per owner as reservations with a service-owned abort signal. Each reservation and published record holds an exact-owner retention lease: the lease transfers from the reservation to the record at publication and is released only after a successful backend close, while a failed startup rollback keeps it as tracked owner activity. Disposal aborts pending spawns, awaits their settlement and rollback, then closes every owned session and awaits quiescence before running owner detachers; a cleanup failure rejects the lifecycle instead of claiming success, and owner or service disposal releases any remaining leases after the cleanup attempt.
+Each published session is a record of its id, owner, optional name, backend type, and backend session, plus the one active send. Unpublished spawns are tracked per owner as reservations with a service-owned abort signal. Each reservation and published record holds an exact-owner retention lease: the lease transfers from the reservation to the record at publication and is released only after a successful backend close, while a failed startup rollback keeps it as tracked owner activity. Disposal aborts pending spawns, awaits their settlement and rollback, then closes every owned session and awaits quiescence before running owner detachers; a cleanup failure rejects the lifecycle instead of claiming success, and its unconfirmed lease stays pinned past owner or service disposal rather than being released in bulk.
 
 ### Ownership and cleanup rules
 
 - Fencing uses the exact `Agent` object: `hasOwnerActivity(owner)` spans unpublished setup through final close with no publication gap, so lifecycle policy can fence the owner precisely.
 - The service retains the exact owner before calling `backend.spawn()`, so idle reclamation skips that owner across pending setup, the published session, closing, and active sends; it does not signal, cancel, or close the backend to release the pin.
-- A backend that cannot clean partial startup resources rejects with `TerminalBackendCleanupError`; the service retains that failure as tracked owner activity until owner or service disposal consumes and reports it.
+- A backend that cannot clean partial startup resources rejects with `TerminalBackendCleanupError`; the service tracks that failure as owner activity, and owner or service disposal reports it but keeps the exact-owner lease pinned because the child's exit is unproven.
 - Caller cancellation keeps its exact `AbortSignal.reason`; `kill()` and disposal resolve only after the backend's captured process tree is quiescent.
 
 ### Send reservation
@@ -135,7 +135,7 @@ These limits define when the service is a poor fit. They are current package con
 - **Process-local sessions** — sessions and raw scrollback live only in this process and do not survive a harness restart; durable work must be committed to files or another persistent system.
 - **No cross-agent sharing** — sessions are intentionally single-owner, with no path to share or transfer a session.
 - **No declarative auto-start** — sessions are created only during agent tool calls.
-- **Idle reclamation pins** — a live session or unresolved startup cleanup blocks idle reclamation for its owner; a backend that cannot confirm close keeps the session and pin until the owner or service disposes.
+- **Idle reclamation pins** — a live session or unresolved startup cleanup blocks idle reclamation for its owner; a backend that cannot confirm close keeps the session and pin through owner or service disposal, leaving the surviving child for an operator to resolve.
 
 <a id="dev-note"></a>
 ### Dev Note

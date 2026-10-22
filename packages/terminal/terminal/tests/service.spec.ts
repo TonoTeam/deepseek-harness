@@ -53,6 +53,7 @@ class StubSession implements TerminalBackendSession {
   readonly pid = 123
   closed: string[] = []
   statusValue: TerminalSessionStatus = { kind: 'running' }
+  childAlive = true
   operation: TerminalSendOperation | undefined
   rejectSend = false
   rejectClose = false
@@ -100,6 +101,7 @@ class StubSession implements TerminalBackendSession {
     this.closed.push(reason)
     if (this.rejectClose) throw new Error('close failed')
     if (this.closeGate !== undefined) await this.closeGate.promise
+    this.childAlive = false
     this.statusValue = { kind: 'exited', exitCode: 0, signal: null }
     this.operation?.cancel()
   }
@@ -238,7 +240,7 @@ describe('TerminalSessionService ownership and lifecycle', () => {
     expect(ctx.agents.get(owner.id)).toBe(owner)
   })
 
-  it('preserves caller cancellation when unpublished rollback fails', async () => {
+  it('preserves caller cancellation and keeps the owner pinned when unpublished rollback fails', async () => {
     const ctx = await harness()
     const gate = Promise.withResolvers<TerminalBackendSession>()
     const session = new StubSession()
@@ -257,7 +259,12 @@ describe('TerminalSessionService ownership and lifecycle', () => {
     expect(ctx.terminals.hasOwnerActivity(owner)).toBe(true)
     const internal = ctx.terminals as unknown as { disposeAll(): Promise<void> }
     await expect(internal.disposeAll()).rejects.toThrow('failed to clean up PTY lifecycle')
-    expect(ctx.terminals.hasOwnerActivity(owner)).toBe(false)
+    // The failed rollback may still own a live child: service teardown reports
+    // the failure but cannot prove the child exited, so the exact owner stays pinned.
+    expect(ctx.agents.get(owner.id)).toBe(owner)
+    expect(ctx.terminals.hasOwnerActivity(owner)).toBe(true)
+    expect(ctx.agents.retention(owner)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
     expect(session.closed).toEqual(['PTY spawn rolled back'])
   })
 
@@ -285,7 +292,7 @@ describe('TerminalSessionService ownership and lifecycle', () => {
     await expect(pending).rejects.toBe(reason)
   })
 
-  it.each(['owner', 'service'] as const)('retains caller-triggered backend cleanup failure until %s disposal', async (scope) => {
+  it.each(['owner', 'service'] as const)('retains caller-triggered backend cleanup failure and its owner pin past %s disposal', async (scope) => {
     const ctx = await harness()
     const started = Promise.withResolvers<undefined>()
     const cleanupFailure = new Error('backend cleanup failed')
@@ -316,7 +323,10 @@ describe('TerminalSessionService ownership and lifecycle', () => {
     }
     const disposal = scope === 'owner' ? internal.disposeOwned(owner) : internal.disposeAll()
     await expect(disposal).rejects.toThrow('failed to clean up PTY lifecycle')
-    expect(ctx.terminals.hasOwnerActivity(owner)).toBe(false)
+    expect(ctx.agents.get(owner.id)).toBe(owner)
+    expect(ctx.terminals.hasOwnerActivity(owner)).toBe(true)
+    expect(ctx.agents.retention(owner)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
   })
 
   it.each([
@@ -660,8 +670,8 @@ describe('TerminalSessionService idle reclamation pin', () => {
     },
   )
 
-  it.each(['confirmed rollback', 'unknown cleanup'] as const)(
-    'pins a failed startup only until %s resolves owner activity',
+  it.each(['confirmed rollback', 'unknown owner cleanup', 'unknown service cleanup'] as const)(
+    'resolves a failed startup after %s without releasing an unconfirmed owner pin',
     async (outcome) => {
       const ctx = await harness()
       const owner = stubAgent(ctx, `startup-${outcome}`)
@@ -673,7 +683,7 @@ describe('TerminalSessionService idle reclamation pin', () => {
       ctx.terminals.registerBackend({
         type: 'failing',
         spawn: async ({ signal }) => {
-          if (outcome === 'unknown cleanup') {
+          if (outcome !== 'confirmed rollback') {
             throw new TerminalBackendCleanupError(new Error('startup failed'), cleanupFailure)
           }
           gate.resolve(rollback)
@@ -694,19 +704,29 @@ describe('TerminalSessionService idle reclamation pin', () => {
         expect(rollback.closed).toEqual(['PTY spawn rolled back'])
         expect(ctx.terminals.hasOwnerActivity(owner)).toBe(false)
         expect(ctx.agents.retention(owner)?.leases).toBe(0)
-      } else {
-        await expect(pending).rejects.toBeInstanceOf(TerminalBackendCleanupError)
-        expect(ctx.terminals.hasOwnerActivity(owner)).toBe(true)
-        expect(ctx.agents.retention(owner)?.leases).toBe(1)
-        expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
-        const internal = ctx.terminals as unknown as { disposeOwned(owner: Agent): Promise<void> }
-        await expect(internal.disposeOwned(owner)).rejects.toThrow('failed to clean up PTY lifecycle')
-        expect(ctx.agents.retention(owner)?.leases).toBe(0)
+        const reclaimable = ctx.agents.sealReclaim(owner)
+        expect(reclaimable).toBeDefined()
+        reclaimable?.abort()
+        await disposeTerminalSessionService(ctx)
+        return
       }
-      const reclaimable = ctx.agents.sealReclaim(owner)
-      expect(reclaimable).toBeDefined()
-      reclaimable?.abort()
+
+      await expect(pending).rejects.toBeInstanceOf(TerminalBackendCleanupError)
+      const service = ctx.terminals
+      expect(service.hasOwnerActivity(owner)).toBe(true)
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+      if (outcome === 'unknown owner cleanup') {
+        const internal = service as unknown as { disposeOwned(owner: Agent): Promise<void> }
+        await expect(internal.disposeOwned(owner)).rejects.toThrow('failed to clean up PTY lifecycle')
+      }
+      // Service teardown reports the unknown cleanup but cannot prove the child
+      // exited, so the exact owner pin must survive both teardown scopes.
       await disposeTerminalSessionService(ctx)
+      expect(ctx.agents.get(owner.id)).toBe(owner)
+      expect(service.hasOwnerActivity(owner)).toBe(true)
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
     },
   )
 
@@ -722,11 +742,13 @@ describe('TerminalSessionService idle reclamation pin', () => {
 
     await expect(ctx.terminals.kill(owner, created.sessionId, 'model request')).rejects.toThrow('close failed')
     expect(ctx.terminals.list(owner)).toHaveLength(1)
+    expect(session.childAlive).toBe(true)
     expect(ctx.agents.retention(owner)?.leases).toBe(1)
     expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
 
     session.rejectClose = false
     expect(await ctx.terminals.kill(owner, created.sessionId, 'model request retry')).toBe(true)
+    expect(session.childAlive).toBe(false)
     expect(session.closed).toEqual(['model request', 'model request retry'])
     expect(ctx.agents.retention(owner)?.leases).toBe(0)
     const reclaimable = ctx.agents.sealReclaim(owner)
@@ -735,25 +757,40 @@ describe('TerminalSessionService idle reclamation pin', () => {
     await disposeTerminalSessionService(ctx)
   })
 
-  it.each(['owner', 'service'] as const)('releases remaining teardown leases when %s cleanup fails', async (scope) => {
+  it.each(['owner', 'service'] as const)('keeps the exact-owner pin after %s teardown hits an unknown close failure', async (scope) => {
     const ctx = await harness()
+    const service = ctx.terminals
     const owner = stubAgent(ctx, `teardown-${scope}`)
     await ctx.agents.register(owner)
     const b = backend('teardown-failure')
     ctx.terminals.registerBackend(b.provider)
     const created = await ctx.terminals.spawn(owner, { type: 'teardown-failure' })
-    b.sessions[0]!.rejectClose = true
-    const internal = ctx.terminals as unknown as {
-      disposeOwned(owner: Agent): Promise<void>
-      disposeAll(): Promise<void>
+    const session = b.sessions[0]!
+    session.rejectClose = true
+    const internal = service as unknown as { disposeOwned(owner: Agent): Promise<void> }
+
+    if (scope === 'owner') {
+      await expect(internal.disposeOwned(owner)).rejects.toThrow('failed to clean up PTY lifecycle')
+    } else {
+      // Cordis logs and swallows a service-fiber disposer failure; retaining
+      // the lease is the only guard when the plugin unload cannot close the child.
+      await disposeTerminalSessionService(ctx)
     }
+    expect(ctx.agents.get(owner.id)).toBe(owner)
+    expect(service.list(owner)).toHaveLength(1)
+    expect(session.childAlive).toBe(true)
+    expect(session.status()).toEqual({ kind: 'running' })
+    expect(ctx.agents.retention(owner)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
 
-    const disposal = scope === 'owner' ? internal.disposeOwned(owner) : internal.disposeAll()
-    await expect(disposal).rejects.toThrow('failed to clean up PTY lifecycle')
+    // A confirmed close is the only release point.
+    session.rejectClose = false
+    expect(await service.kill(owner, created.sessionId, 'teardown retry')).toBe(true)
+    expect(session.childAlive).toBe(false)
     expect(ctx.agents.retention(owner)?.leases).toBe(0)
-
-    b.sessions[0]!.rejectClose = false
-    await ctx.terminals.kill(owner, created.sessionId, 'teardown retry')
+    const reclaimable = ctx.agents.sealReclaim(owner)
+    expect(reclaimable).toBeDefined()
+    reclaimable?.abort()
     await disposeTerminalSessionService(ctx)
   })
 
