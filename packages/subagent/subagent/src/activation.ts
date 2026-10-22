@@ -16,15 +16,17 @@ import type { SubagentResult, SubagentRun } from './types.ts'
  * Single lifetime owner for one exact-parent usage lease.
  *
  * Ordinary release happens once the activation's settlement notice is queued.
- * A failed teardown moves the lease to an unconfirmed stop: release requests
- * from every rollback layer are ignored until the supplied terminal signal
- * settles, so an unknown backend outcome cannot let idle reclamation reclaim
- * the parent. Without such a signal the lease stays held rather than guessing.
+ * A failed disposal or child teardown leaves the child's stop unknown; that
+ * outcome retains the lease permanently because a settled result can precede
+ * backend process shutdown and therefore never proves the child stopped.
+ * Release requests from every rollback layer then become no-ops, so idle
+ * reclamation cannot reclaim the parent. Resolving that unknown state is an
+ * operator action, not an automatic transition.
  */
 export class ParentLease {
   private readonly lease: AgentActivityLease
   private released = false
-  private unknownStop = false
+  private unconfirmed = false
 
   /**
    * Take ownership of one exact-parent usage lease.
@@ -35,36 +37,27 @@ export class ParentLease {
   }
 
   /**
-   * Release the parent unless an earlier failed teardown left its stop
-   * unconfirmed. Subsequent calls are no-ops.
+   * Release the parent unless an earlier failure left its stop unconfirmed.
+   * Subsequent calls are no-ops.
    */
   release(): void {
-    if (this.released || this.unknownStop) return
+    if (this.released || this.unconfirmed) return
     this.released = true
     this.lease.release()
   }
 
   /**
-   * Record that teardown failed and the child may still be running. The lease
-   * remains held until `confirmation` settles; absence of a confirmation means
-   * no observable stop signal, so the lease stays held indefinitely.
-   * @param confirmation - terminal execution signal that proves the child stopped.
+   * Permanently retain the lease after a teardown whose outcome is unknown.
+   *
+   * A rejected provider start or native create/resume may have begun side
+   * effects without confirming their cleanup. Disposal rejection, rollback
+   * failure, and child-teardown failure likewise leave open whether the child
+   * still runs. Result settlement or cancellation is not stop proof, so this
+   * lease is never released automatically; an operator must confirm the child
+   * stopped before the parent can be reclaimed.
    */
-  deferUntilStopped(confirmation?: Promise<unknown>): void {
-    if (this.released || this.unknownStop) return
-    this.unknownStop = true
-    if (confirmation === undefined) return
-    void confirmation.then(
-      () => { this.confirmStopped() },
-      () => { this.confirmStopped() },
-    )
-  }
-
-  /** Release the held lease after the deferred stop signal arrives. */
-  private confirmStopped(): void {
-    if (this.released) return
-    this.unknownStop = false
-    this.release()
+  markUnconfirmed(): void {
+    this.unconfirmed = true
   }
 }
 
@@ -106,8 +99,8 @@ interface ActivationBase {
   /**
    * Exact-parent usage lease acquired before preparation or materialization.
    * One lease covers startup, execution, cleanup, and settlement notification;
-   * it is released only after the parent result has been queued, and stays
-   * held across an unconfirmed teardown failure.
+   * it is released after the parent result has been queued only when cleanup
+   * was confirmed, and is retained permanently after an unknown teardown.
    */
   readonly parentLease: ParentLease
   readonly delivery: 'parent' | 'caller'

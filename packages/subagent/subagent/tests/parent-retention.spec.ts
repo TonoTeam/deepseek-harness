@@ -99,9 +99,30 @@ describe('subagent parent retention', () => {
       request: { parent, prompt: [{ type: 'text', text: 'fail' }] },
     })).rejects.toThrow('prepare failed')
     expect(ctx.agents.retention(parent)?.leases).toBe(0)
+
+    // A native create rejection may follow partial Agent startup; the factory
+    // swallows its rollback failure, so the parent stays pinned.
+    const create = vi.spyOn(ctx.agents, 'create').mockRejectedValueOnce(new Error('native create failed'))
+    ctx.subagents.registerProvider({
+      name: 'created-local',
+      inheritsParentContext: false,
+      capabilities: { agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: true },
+      prepareContinuable: async () => ({}),
+    })
+    await expect(ctx.subagents.startActivation({
+      provider: 'created-local',
+      label: 'created local child',
+      signal: new AbortController().signal,
+      delivery: 'parent',
+      request: { parent, prompt: [{ type: 'text', text: 'fail after create' }] },
+    })).rejects.toThrow('native create failed')
+    expect(create).toHaveBeenCalledOnce()
+    expect(ctx.agents.retention(parent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
+    expect(ctx.agents.get(parent.id)).toBe(parent)
   })
 
-  it('pins through external startup and cleanup, and releases on failure or cancellation', async () => {
+  it('pins through external startup and cleanup, and releases after confirmed cleanup', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionProjectionRegistry)
     await mountWorkingDirectoryFixture(ctx)
@@ -163,27 +184,73 @@ describe('subagent parent retention', () => {
     expect(noticeLease).toBe(1)
     expect(ctx.agents.retention(parent)?.leases).toBe(0)
     expect(JSON.stringify(parent.inbox.nextTurn)).toContain('CHILD_RESULT_42')
+  })
 
-    // A rejecting backend start releases the lease before the caller sees it.
+  it.each([
+    { outcome: 'a plain error', rejection: () => new Error('backend start failed') },
+    { outcome: 'a cancellation', rejection: () => Object.assign(new Error('startup cancelled'), { name: 'AbortError' }) },
+    {
+      outcome: 'an AggregateError from failed startup cleanup',
+      rejection: () => new AggregateError([new Error('cleanup outcome unknown')], 'startup cancelled'),
+    },
+  ])('retains the parent lease when external start rejects after partial startup with $outcome', async ({ rejection }) => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
+    await ctx.plugin(SubagentRuntime)
+    const parent = await externalTestParent(ctx)
+
+    let childAlive = false
+    const failure = rejection()
     ctx.subagents.registerProvider({
-      name: 'failing-external',
+      name: 'partially-started-external',
       inheritsParentContext: false,
       capabilities: { agentOptions: false, agentPreset: false, outputSchema: false, depthLimit: false },
-      start: async () => { throw new Error('backend start failed') },
+      start: async () => {
+        childAlive = true
+        throw failure
+      },
     })
     await expect(ctx.subagents.startActivation({
-      provider: 'failing-external',
-      label: 'failing external child',
+      provider: 'partially-started-external',
+      label: 'partially started external child',
       signal: new AbortController().signal,
       delivery: 'caller',
-      request: { parent, prompt: [{ type: 'text', text: 'fail' }] },
-    })).rejects.toThrow('backend start failed')
-    expect(ctx.agents.retention(parent)?.leases).toBe(0)
+      request: { parent, prompt: [{ type: 'text', text: 'fail after startup' }] },
+    })).rejects.toThrow(failure.message)
 
-    // A returned run whose publication is aborted after startup, and whose
-    // disposal rejects while its result is still pending, has no confirmed stop.
-    // Every rollback layer shares one lease owner, so the parent stays pinned
-    // until the run's own terminal signal, then becomes reclaimable again.
+    // The provider started the backend before rejecting and returned no run,
+    // so no public cleanup success exists: the parent stays pinned.
+    expect(childAlive).toBe(true)
+    expect(ctx.agents.retention(parent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
+    expect(ctx.agents.get(parent.id)).toBe(parent)
+  })
+
+  it.each([
+    {
+      outcome: 'resolves',
+      settle: (result: PromiseWithResolvers<SubagentResult>) => { result.resolve(complete) },
+    },
+    {
+      outcome: 'rejects',
+      settle: (result: PromiseWithResolvers<SubagentResult>) => {
+        result.reject(new Error('external run failed'))
+      },
+    },
+    {
+      outcome: 'is cancelled',
+      settle: (result: PromiseWithResolvers<SubagentResult>) => {
+        result.reject(Object.assign(new Error('external run cancelled'), { name: 'AbortError' }))
+      },
+    },
+  ])('retains the parent lease when an unpublished external disposal rejects and its result $outcome', async ({ settle }) => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
+    await ctx.plugin(SubagentRuntime)
+    const parent = await externalTestParent(ctx)
+
     const abortRun = new AbortController()
     const startReached = Promise.withResolvers<undefined>()
     const returnedRun = Promise.withResolvers<SubagentRun>()
@@ -213,39 +280,62 @@ describe('subagent parent retention', () => {
     abortRun.abort(new Error('startup cancelled'))
     returnedRun.resolve(unknownRun)
     await expect(unknown).rejects.toThrow('startup cancelled')
+
+    // The rollback could not confirm that the backend stopped, so the parent
+    // is pinned even though the run is no longer reachable by the manager.
+    expect(ctx.agents.retention(parent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
+
+    // Result settlement, rejection, and cancellation are not stop proof: none
+    // of them may reduce the retained lease or let the parent be reclaimed.
+    settle(unknownResult)
+    await unknownResult.promise.catch(() => undefined)
+    await Promise.resolve()
     expect(ctx.agents.retention(parent)?.leases).toBe(1)
     expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
     expect(ctx.agents.get(parent.id)).toBe(parent)
+  })
 
-    unknownResult.resolve(complete)
-    await vi.waitFor(() => { expect(ctx.agents.retention(parent)?.leases).toBe(0) })
-    const released = ctx.agents.sealReclaim(parent)
-    expect(released).toBeDefined()
-    released?.abort()
-    // Cancellation during a hung startup rejects the start and also releases.
-    const abortEntered = Promise.withResolvers<undefined>()
+  it('retains the parent lease when a published external activation disposal rejects', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
+    await ctx.plugin(SubagentRuntime)
+    const parent = await externalTestParent(ctx)
+
+    const result = Promise.withResolvers<SubagentResult>()
+    const disposeEntered = Promise.withResolvers<undefined>()
+    const run: SubagentRun = {
+      id: SessionId('retention-published-child'),
+      result: result.promise,
+      dispose: async () => {
+        disposeEntered.resolve(undefined)
+        throw new Error('dispose outcome unknown')
+      },
+    }
     ctx.subagents.registerProvider({
-      name: 'cancelled-external',
+      name: 'rejecting-dispose-external',
       inheritsParentContext: false,
       capabilities: { agentOptions: false, agentPreset: false, outputSchema: false, depthLimit: false },
-      start: ({ signal }) => new Promise((_resolve, reject) => {
-        abortEntered.resolve(undefined)
-        signal.addEventListener('abort', () => { reject(new Error('startup cancelled')) }, { once: true })
-      }),
+      start: async () => run,
     })
-    const cancelled = ctx.subagents.startActivation({
-      provider: 'cancelled-external',
-      label: 'cancelled external child',
+    const activation = await ctx.subagents.startActivation({
+      provider: 'rejecting-dispose-external',
+      label: 'rejecting external child',
       signal: new AbortController().signal,
       delivery: 'caller',
-      request: { parent, prompt: [{ type: 'text', text: 'cancel' }] },
+      request: { parent, prompt: [{ type: 'text', text: 'work' }] },
     })
-    await abortEntered.promise
     expect(ctx.agents.retention(parent)?.leases).toBe(1)
-    await ctx.subagents.drainDescendants([parent])
-    await expect(cancelled).rejects.toThrow('startup cancelled')
-    expect(ctx.agents.retention(parent)?.leases).toBe(0)
 
+    result.resolve(complete)
+    await disposeEntered.promise
+    await expect(activation.result).resolves.toEqual(complete)
+    // The captured result was delivered, but the failed handle teardown can
+    // still hide a running backend, so the parent remains pinned.
+    expect(ctx.agents.retention(parent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
+    expect(ctx.agents.get(parent.id)).toBe(parent)
   })
 
   it('pins the parent across a hung cold-resume observation and releases after the queued notice', async () => {
@@ -308,7 +398,7 @@ describe('subagent parent retention', () => {
     const resumeAgent = ctx.agents.resume.bind(ctx.agents)
     const resumeObserved = Promise.withResolvers<undefined>()
     const releaseResume = Promise.withResolvers<undefined>()
-    vi.spyOn(ctx.agents, 'resume').mockImplementation(async (options) => {
+    const resumeMock = vi.spyOn(ctx.agents, 'resume').mockImplementation(async (options) => {
       resumeObserved.resolve(undefined)
       await releaseResume.promise
       return resumeAgent(options)
@@ -338,5 +428,14 @@ describe('subagent parent retention', () => {
     await vi.waitFor(() => { expect(ctx.agents.retention(parent)?.leases).toBe(0) })
     await parent.whenIdle()
     expect(JSON.stringify(adapter.requests.at(-1)?.messages ?? [])).toContain('resumed child')
+
+    // A native resume rejection may follow partial Agent startup; the factory
+    // swallows its rollback failure, so the parent stays pinned.
+    await vi.waitFor(() => { expect(ctx.agents.get(started.childId)).toBeUndefined() })
+    resumeMock.mockRejectedValueOnce(new Error('native resume failed'))
+    await expect(queue(started.childId, 'fail resume')).rejects.toThrow('is unavailable')
+    expect(ctx.agents.retention(parent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
+    expect(ctx.agents.get(parent.id)).toBe(parent)
   })
 })
