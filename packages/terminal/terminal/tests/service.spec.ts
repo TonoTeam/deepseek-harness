@@ -1,7 +1,7 @@
-import { describe, expect, expectTypeOf, it } from 'vitest'
+import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { AgentReclaimingError } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import TerminalSessionService, { TerminalBackendCleanupError, TerminalError, TerminalSessionId } from '@deepseek-ai/dsh-terminal'
 import type {
@@ -600,5 +600,177 @@ describe('TerminalSessionService ownership and lifecycle', () => {
     await expect(internal.disposeAll()).rejects.toThrow('failed to clean up PTY lifecycle')
     expect(internal.backends.size).toBe(0)
     expect(internal.ownerCleanups.size).toBe(0)
+  })
+})
+
+describe('TerminalSessionService idle reclamation pin', () => {
+  it.each(['pending', 'resident', 'closing'] as const)(
+    'refuses reclamation while a %s spawn/session is live and leaves backend cancellation to explicit kill',
+    async (stage) => {
+      const ctx = await harness()
+      const owner = stubAgent(ctx, `owner-${stage}`)
+      await ctx.agents.register(owner)
+      const session = new StubSession()
+      let backendSignal: AbortSignal | undefined
+      const gate = Promise.withResolvers<TerminalBackendSession>()
+      const spawn = vi.fn((spec: { signal?: AbortSignal }) => {
+        backendSignal = spec.signal
+        return stage === 'pending' ? gate.promise : Promise.resolve(session)
+      })
+      ctx.terminals.registerBackend({ type: 'gated', spawn })
+
+      const created = ctx.terminals.spawn(owner, { type: 'gated' })
+      let id: TerminalSessionIdType | undefined
+      if (stage === 'pending') {
+        await vi.waitFor(() => { expect(spawn).toHaveBeenCalledOnce() })
+        expect(backendSignal?.aborted).toBe(false)
+      } else {
+        id = (await created).sessionId
+      }
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+      expect(backendSignal?.aborted).toBe(false)
+
+      if (stage === 'pending') {
+        gate.resolve(session)
+        id = (await created).sessionId
+        expect(await ctx.terminals.kill(owner, id, 'model request')).toBe(true)
+      } else if (stage === 'closing') {
+        session.closeGate = Promise.withResolvers<undefined>()
+        const closing = ctx.terminals.kill(owner, id!, 'model request')
+        await vi.waitFor(() => { expect(session.closed).toEqual(['model request']) })
+        expect(() => ctx.terminals.startSend(owner, id!, { text: '', submit: false })).toThrow('closing')
+        expect(ctx.agents.retention(owner)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+        expect(session.closed).toEqual(['model request'])
+        session.closeGate.resolve(undefined)
+        await closing
+      } else {
+        expect(session.closed).toEqual([])
+        expect(await ctx.terminals.kill(owner, id!, 'model request')).toBe(true)
+      }
+
+      // The real resource close is the only release point; a sealed owner then admits reclaim.
+      expect(session.closed).toEqual(['model request'])
+      expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      const ticket = ctx.agents.sealReclaim(owner)
+      expect(ticket).toBeDefined()
+      ticket?.abort()
+      await disposeTerminalSessionService(ctx)
+    },
+  )
+
+  it.each(['confirmed rollback', 'unknown cleanup'] as const)(
+    'pins a failed startup only until %s resolves owner activity',
+    async (outcome) => {
+      const ctx = await harness()
+      const owner = stubAgent(ctx, `startup-${outcome}`)
+      await ctx.agents.register(owner)
+      const cleanupFailure = new Error('backend cleanup failed')
+      const rollback = new StubSession()
+      const gate = Promise.withResolvers<TerminalBackendSession>()
+      const controller = new AbortController()
+      ctx.terminals.registerBackend({
+        type: 'failing',
+        spawn: async ({ signal }) => {
+          if (outcome === 'unknown cleanup') {
+            throw new TerminalBackendCleanupError(new Error('startup failed'), cleanupFailure)
+          }
+          gate.resolve(rollback)
+          if (signal === undefined) throw new Error('missing spawn signal')
+          await new Promise<undefined>((resolve) => {
+            signal.addEventListener('abort', () => { resolve(undefined) }, { once: true })
+          })
+          controller.abort(new Error('cancelled during startup'))
+          return rollback
+        },
+      })
+
+      const pending = ctx.terminals.spawn(owner, { type: 'failing' }, controller.signal)
+      if (outcome === 'confirmed rollback') {
+        await vi.waitFor(() => { expect(ctx.agents.retention(owner)?.leases).toBe(1) })
+        controller.abort(new Error('cancelled during startup'))
+        await expect(pending).rejects.toThrow('cancelled during startup')
+        expect(rollback.closed).toEqual(['PTY spawn rolled back'])
+        expect(ctx.terminals.hasOwnerActivity(owner)).toBe(false)
+        expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      } else {
+        await expect(pending).rejects.toBeInstanceOf(TerminalBackendCleanupError)
+        expect(ctx.terminals.hasOwnerActivity(owner)).toBe(true)
+        expect(ctx.agents.retention(owner)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+        const internal = ctx.terminals as unknown as { disposeOwned(owner: Agent): Promise<void> }
+        await expect(internal.disposeOwned(owner)).rejects.toThrow('failed to clean up PTY lifecycle')
+        expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      }
+      const reclaimable = ctx.agents.sealReclaim(owner)
+      expect(reclaimable).toBeDefined()
+      reclaimable?.abort()
+      await disposeTerminalSessionService(ctx)
+    },
+  )
+
+  it('keeps the owner pin while a failed close leaves the backend session alive', async () => {
+    const ctx = await harness()
+    const owner = stubAgent(ctx, 'close-failure')
+    await ctx.agents.register(owner)
+    const b = backend('close-failure')
+    ctx.terminals.registerBackend(b.provider)
+    const created = await ctx.terminals.spawn(owner, { type: 'close-failure' })
+    const session = b.sessions[0]!
+    session.rejectClose = true
+
+    await expect(ctx.terminals.kill(owner, created.sessionId, 'model request')).rejects.toThrow('close failed')
+    expect(ctx.terminals.list(owner)).toHaveLength(1)
+    expect(ctx.agents.retention(owner)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+
+    session.rejectClose = false
+    expect(await ctx.terminals.kill(owner, created.sessionId, 'model request retry')).toBe(true)
+    expect(session.closed).toEqual(['model request', 'model request retry'])
+    expect(ctx.agents.retention(owner)?.leases).toBe(0)
+    const reclaimable = ctx.agents.sealReclaim(owner)
+    expect(reclaimable).toBeDefined()
+    reclaimable?.abort()
+    await disposeTerminalSessionService(ctx)
+  })
+
+  it.each(['owner', 'service'] as const)('releases remaining teardown leases when %s cleanup fails', async (scope) => {
+    const ctx = await harness()
+    const owner = stubAgent(ctx, `teardown-${scope}`)
+    await ctx.agents.register(owner)
+    const b = backend('teardown-failure')
+    ctx.terminals.registerBackend(b.provider)
+    const created = await ctx.terminals.spawn(owner, { type: 'teardown-failure' })
+    b.sessions[0]!.rejectClose = true
+    const internal = ctx.terminals as unknown as {
+      disposeOwned(owner: Agent): Promise<void>
+      disposeAll(): Promise<void>
+    }
+
+    const disposal = scope === 'owner' ? internal.disposeOwned(owner) : internal.disposeAll()
+    await expect(disposal).rejects.toThrow('failed to clean up PTY lifecycle')
+    expect(ctx.agents.retention(owner)?.leases).toBe(0)
+
+    b.sessions[0]!.rejectClose = false
+    await ctx.terminals.kill(owner, created.sessionId, 'teardown retry')
+    await disposeTerminalSessionService(ctx)
+  })
+
+  it('rejects sealed acquisition before backend spawn', async () => {
+    const ctx = await harness()
+    const owner = stubAgent(ctx, 'sealed')
+    await ctx.agents.register(owner)
+    const spawn = vi.fn(async () => new StubSession())
+    ctx.terminals.registerBackend({ type: 'sealed', spawn })
+
+    const ticket = ctx.agents.sealReclaim(owner)
+    expect(ticket).toBeDefined()
+    await expect(ctx.terminals.spawn(owner, { type: 'sealed' })).rejects.toBeInstanceOf(AgentReclaimingError)
+    expect(spawn).not.toHaveBeenCalled()
+    expect(ctx.terminals.hasOwnerActivity(owner)).toBe(false)
+    expect(ctx.agents.retention(owner)?.leases).toBe(0)
+    ticket?.abort()
+    await disposeTerminalSessionService(ctx)
   })
 })

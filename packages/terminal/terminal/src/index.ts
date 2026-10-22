@@ -5,7 +5,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease } from '@deepseek-ai/dsh-agent'
 import { TerminalBackendCleanupError } from './types.ts'
 import type {
   TerminalBackend,
@@ -85,6 +85,8 @@ interface SessionRecord {
   readonly name: string | undefined
   readonly type: string
   readonly session: TerminalBackendSession
+  /** Exact-owner reclamation lease held until this backend resource is released. */
+  readonly lease: AgentActivityLease
   active: TerminalSendOperation | undefined
   closing: Promise<void> | undefined
 }
@@ -93,12 +95,19 @@ interface PendingSpawn {
   readonly owner: Agent
   readonly controller: AbortController
   readonly settled: Promise<void>
+  /** Pins reclamation from before `backend.spawn()` until the spawn settles or publishes. */
+  readonly lease: AgentActivityLease
   cleanupFailure: { error: unknown } | undefined
 }
 
 interface SpawnReservation {
   readonly signal: AbortSignal
-  release(cleanupFailure: { error: unknown } | undefined): void
+  /**
+   * Settle the unpublished reservation.
+   * @param cleanupFailure - a failed rollback that leaves tracked owner activity.
+   * @param transferred - the published record now owns the lease.
+   */
+  release(cleanupFailure: { error: unknown } | undefined, transferred?: boolean): void
 }
 
 /** In-process registry for replaceable PTY backends and exact-Agent sessions. */
@@ -146,10 +155,13 @@ export class TerminalSessionService extends Service {
 
   /**
    * Create and publish one owner-scoped session after backend setup succeeds.
+   * The exact owner is retained before backend setup and stays pinned against
+   * idle reclamation for the returned session's lifetime.
    * @param owner - exact registered Agent that owns access and cleanup.
    * @param request - backend type plus optional owner-local name and cwd.
    * @param signal - cancellation of unpublished setup.
    * @returns published identity, metadata, status, and MOTD.
+   * @throws `AgentReclaimingError` when the owner is sealed for reclamation; no backend starts.
    */
   async spawn(owner: Agent, request: TerminalSpawnRequest, signal?: AbortSignal): Promise<TerminalSpawnResult> {
     this.assertActive()
@@ -159,13 +171,21 @@ export class TerminalSessionService extends Service {
     if (backend === undefined) throw new TerminalError(`no PTY backend registered for "${request.type}"`, 'NO_BACKEND')
     if (request.name !== undefined && request.name.length === 0) throw new Error('PTY session name must be non-empty')
     const releaseName = this.reserveName(owner, request.name)
-    const spawnReservation = this.reserveSpawn(owner)
+    let lease: AgentActivityLease
+    try {
+      lease = this.retainOwner(owner)
+    } catch (error) {
+      releaseName()
+      throw error
+    }
+    const spawnReservation = this.reserveSpawn(owner, lease)
     const backendSignal = signal === undefined
       ? spawnReservation.signal
       : AbortSignal.any([signal, spawnReservation.signal])
     const sessionId = TerminalSessionId(`pty-${++this.nextId}`)
     let session: TerminalBackendSession | undefined
     let cleanupFailure: { error: unknown } | undefined
+    let published = false
     try {
       session = await backend.spawn({
         sessionId,
@@ -188,10 +208,12 @@ export class TerminalSessionService extends Service {
         name: request.name,
         type: request.type,
         session,
+        lease,
         active: undefined,
         closing: undefined,
       }
       this.sessions.set(sessionId, record)
+      published = true
       return this.snapshot(record, session.motd)
     } catch (error) {
       if (error instanceof TerminalBackendCleanupError) {
@@ -218,7 +240,7 @@ export class TerminalSessionService extends Service {
       }
       throw failure
     } finally {
-      spawnReservation.release(cleanupFailure)
+      spawnReservation.release(cleanupFailure, published)
       releaseName()
     }
   }
@@ -226,7 +248,7 @@ export class TerminalSessionService extends Service {
   /**
    * Test whether an exact owner has a published session or unpublished spawn.
    * @param owner - exact live owner to inspect.
-   * @returns true across the entire spawn-to-close interval, with no publication gap.
+   * @returns true across the spawn-to-close interval; failed cleanup stays active until disposal.
    */
   hasOwnerActivity(owner: Agent): boolean {
     return (this.pendingSpawns.get(owner)?.size ?? 0) > 0
@@ -277,6 +299,7 @@ export class TerminalSessionService extends Service {
 
   /**
    * Close one owned session and remove it only after quiescent backend cleanup.
+   * The exact-owner reclamation lease is released only after the backend close succeeds.
    * @param owner - exact session owner.
    * @param id - target PTY identity.
    * @param reason - diagnostic cleanup reason.
@@ -293,6 +316,7 @@ export class TerminalSessionService extends Service {
     try {
       await closing
       this.sessions.delete(id)
+      record.lease.release()
       return true
     } catch (error) {
       record.closing = undefined
@@ -317,6 +341,15 @@ export class TerminalSessionService extends Service {
 
   private isLiveOwner(owner: Agent): boolean {
     return !this.disposedOwners.has(owner) && this.ctx.get('agents')?.get(owner.id) === owner
+  }
+
+  /** Acquire the exact-owner reclamation lease before any backend side effect. */
+  private retainOwner(owner: Agent): AgentActivityLease {
+    const agents = this.ctx.get('agents')
+    if (agents === undefined) {
+      throw new TerminalError(`agent "${owner.id}" is not the registered PTY owner`, 'OWNER_NOT_LIVE')
+    }
+    return agents.retain(owner)
   }
 
   private ensureOwnerCleanup(owner: Agent): void {
@@ -347,18 +380,28 @@ export class TerminalSessionService extends Service {
     }
   }
 
-  private reserveSpawn(owner: Agent): SpawnReservation {
+  private reserveSpawn(owner: Agent, lease: AgentActivityLease): SpawnReservation {
     const controller = new AbortController()
     const settlement = Promise.withResolvers<void>()
-    const pending: PendingSpawn = { owner, controller, settled: settlement.promise, cleanupFailure: undefined }
+    const pending: PendingSpawn = {
+      owner,
+      controller,
+      settled: settlement.promise,
+      lease,
+      cleanupFailure: undefined,
+    }
     const owned = this.pendingSpawns.get(owner) ?? new Set<PendingSpawn>()
     owned.add(pending)
     this.pendingSpawns.set(owner, owned)
     return {
       signal: controller.signal,
-      release: (cleanupFailure) => {
+      release: (cleanupFailure, transferred = false) => {
         pending.cleanupFailure = cleanupFailure
-        if (cleanupFailure === undefined) this.removePendingSpawn(pending)
+        if (cleanupFailure === undefined) {
+          this.removePendingSpawn(pending)
+          // A published record owns the transferred lease for the resource lifetime.
+          if (!transferred) pending.lease.release()
+        }
         settlement.resolve()
       },
     }
@@ -378,7 +421,12 @@ export class TerminalSessionService extends Service {
     for (const spawn of pending) spawn.controller.abort(reason)
     await Promise.all(pending.map(spawn => spawn.settled))
     const failures = pending.flatMap(spawn => spawn.cleanupFailure === undefined ? [] : [spawn.cleanupFailure.error])
-    for (const spawn of pending) this.removePendingSpawn(spawn)
+    for (const spawn of pending) {
+      this.removePendingSpawn(spawn)
+      // Teardown abandons an unreported backend resource with its owner/service,
+      // so the lease must converge here rather than outlive the terminal service.
+      spawn.lease.release()
+    }
     if (failures.length > 0) {
       throw new AggregateError(failures, 'failed to roll back unpublished PTY setup')
     }
@@ -429,6 +477,7 @@ export class TerminalSessionService extends Service {
       )
     } finally {
       this.reservedNames.delete(owner)
+      this.releaseLeases(owner)
     }
   }
 
@@ -447,9 +496,17 @@ export class TerminalSessionService extends Service {
       this.backends.clear()
       this.reservedNames.clear()
       this.pendingSpawns.clear()
+      this.releaseLeases()
       const cleanups = [...this.ownerCleanups.values()]
       this.ownerCleanups.clear()
       await Promise.all(cleanups.map(cleanup => Promise.resolve(cleanup())))
+    }
+  }
+
+  /** Release reclamation leases for one owner, or every remaining owner during service teardown. */
+  private releaseLeases(owner?: Agent): void {
+    for (const record of this.sessions.values()) {
+      if (owner === undefined || record.owner === owner) record.lease.release()
     }
   }
 
@@ -460,6 +517,7 @@ export class TerminalSessionService extends Service {
       try {
         await closing
         this.sessions.delete(record.id)
+        record.lease.release()
       } catch (error: unknown) {
         // A concurrent retry may already own a newer fence; never clear it.
         if (record.closing === closing) record.closing = undefined

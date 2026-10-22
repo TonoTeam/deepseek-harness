@@ -1,5 +1,5 @@
 import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { AgentReclaimingError } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { unsupportedInbox } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -90,31 +90,46 @@ describe('Session browser resource ownership', () => {
     await resources.dispose()
   })
 
-  it('releases a failed acquisition and can acquire for another Session', async () => {
+  it('keeps a failed acquisition pinned and refuses another exclusive owner', async () => {
     const { ctx, owner } = await fixture()
     const a = await owner('a')
     const b = await owner('b')
-    const open = vi.fn().mockRejectedValueOnce(new Error('browser unavailable')).mockResolvedValue({ value: 1, close: async () => {} })
+    const failure = new Error('browser unavailable')
+    const open = vi.fn().mockRejectedValue(failure)
     const resources = new SessionResources<number>(ctx, { label: 'test', exclusive: true, open })
-    await expect(resources.get(a.agent, new AbortController().signal)).rejects.toThrow('browser unavailable')
-    expect(await resources.get(b.agent)).toBe(1)
-    await resources.dispose()
+    await expect(resources.get(a.agent, new AbortController().signal)).rejects.toBe(failure)
+    // A rejected open may follow an unconfirmed rollback, so the entry and pin stay.
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    expect(resources.available(a.agent)).toBe(true)
+    await expect(resources.get(a.agent)).rejects.toBe(failure)
+    expect(open).toHaveBeenCalledOnce()
+    await expect(resources.get(b.agent)).rejects.toThrow('already reserved')
+    await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(open).toHaveBeenCalledOnce()
+    await a.dispose()
+    await resources.dispose().catch(() => undefined)
   })
 
-  it('retries failed acquisition for the same live owner without duplicating cleanup', async () => {
+  it('does not replay a failed acquisition for the same live owner', async () => {
     const { ctx, owner } = await fixture()
     const a = await owner('a')
     const close = vi.fn(async () => {})
     const open = vi.fn().mockRejectedValueOnce(new Error('launch failed')).mockResolvedValue({ value: 1, close })
     const resources = new SessionResources<number>(ctx, { label: 'test', exclusive: false, open })
     await expect(resources.get(a.agent)).rejects.toThrow('launch failed')
-    expect(await resources.get(a.agent)).toBe(1)
+    await expect(resources.get(a.agent)).rejects.toThrow('launch failed')
+    expect(open).toHaveBeenCalledOnce()
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+    expect(close).not.toHaveBeenCalled()
     await a.dispose()
-    await resources.dispose()
-    expect(close).toHaveBeenCalledTimes(1)
+    await resources.dispose().catch(() => undefined)
   })
 
-  it('quiesces disposal when an in-flight acquisition fails during rollback', async () => {
+  it('retains the pin when an in-flight acquisition fails during rollback', async () => {
     const { ctx, owner } = await fixture()
     const a = await owner('a')
     const entered = Promise.withResolvers<undefined>()
@@ -128,7 +143,12 @@ describe('Session browser resource ownership', () => {
     await entered.promise
     const disposing = resources.dispose()
     failed.reject(new Error('launch failed'))
-    await Promise.all([rejected, disposing])
+    await rejected
+    await expect(disposing).rejects.toThrow('browser cleanup failed')
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    await a.dispose()
+    await resources.dispose().catch(() => undefined)
   })
 
   it('serializes one Session while another proceeds and skips cancelled queued work', async () => {
@@ -226,7 +246,7 @@ describe('Session browser resource ownership', () => {
     }
   })
 
-  it('retains a late initialization failure after its only caller canceled before waiting', async () => {
+  it('retains a late initialization failure and its pin after its only caller canceled', async () => {
     const { ctx, owner } = await fixture()
     const a = await owner('a')
     const b = await owner('b')
@@ -238,9 +258,15 @@ describe('Session browser resource ownership', () => {
     controller.abort(new Error('cancel before waiting'))
     await expect(running).rejects.toThrow('cancel before waiting')
     ready.reject(new Error('late browser startup failed'))
-    await vi.waitFor(() => { expect(resources.available(b.agent)).toBe(true) })
-    expect(await resources.get(b.agent)).toBe(1)
-    await resources.dispose()
+    await vi.waitFor(() => { expect(ctx.agents.retention(a.agent)?.leases).toBe(1) })
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    expect(resources.available(b.agent)).toBe(false)
+    expect(await resources.get(a.agent).catch((error: unknown) => error)).toMatchObject({ message: 'late browser startup failed' })
+    await expect(resources.get(b.agent)).rejects.toThrow('already reserved')
+    expect(open).toHaveBeenCalledOnce()
+    await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+    await a.dispose()
+    await resources.dispose().catch(() => undefined)
   })
 
   it('reports non-Error cancellation and acquisition failures through cancellable waits', async () => {
@@ -266,7 +292,11 @@ describe('Session browser resource ownership', () => {
     const b = await owner('b')
     const failed = new SessionResources<number>(ctx, { label: 'test', exclusive: false, open: vi.fn().mockRejectedValue('failed to connect') })
     await expect(failed.get(b.agent, new AbortController().signal)).rejects.toThrow('failed to connect')
-    await failed.dispose()
+    expect(ctx.agents.retention(b.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(b.agent)).toBeUndefined()
+    await expect(failed.dispose()).rejects.toThrow('browser cleanup failed')
+    await b.dispose()
+    await failed.dispose().catch(() => undefined)
   })
 
   it('closes a late acquisition and waits for its shutdown during racing disposals', async () => {
@@ -354,4 +384,156 @@ it('reports early disposal cleanup failure while retaining the owned resource', 
   expect(warning).toHaveBeenCalledWith(expect.stringContaining('cleanup during Session cancellation failed'))
   await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
   warning.mockRestore()
+})
+
+describe('Session browser resource idle reclamation pin', () => {
+  it.each(['pending open', 'resident connection', 'closing connection'] as const)(
+    'holds the exact-owner lease during %s and releases it only after successful close',
+    async (stage) => {
+      const { ctx, owner } = await fixture()
+      const a = await owner(`pin-${stage}`)
+      const entered = Promise.withResolvers<undefined>()
+      const openRelease = Promise.withResolvers<undefined>()
+      const closeEntered = Promise.withResolvers<undefined>()
+      const closeRelease = Promise.withResolvers<undefined>()
+      let acquisitionSignal: AbortSignal | undefined
+      const close = vi.fn(async () => {
+        if (stage !== 'closing connection') return
+        closeEntered.resolve(undefined)
+        await closeRelease.promise
+      })
+      const resources = new SessionResources<number>(ctx, {
+        label: 'pin',
+        exclusive: true,
+        async open(_agent, signal) {
+          acquisitionSignal = signal
+          if (stage === 'pending open') {
+            entered.resolve(undefined)
+            await openRelease.promise
+          }
+          return { value: 1, close }
+        },
+      })
+      const acquiring = resources.get(a.agent)
+      if (stage === 'pending open') {
+        await entered.promise
+        expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+        expect(acquisitionSignal?.aborted).toBe(false)
+        openRelease.resolve(undefined)
+      }
+      expect(await acquiring).toBe(1)
+
+      expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+      expect(acquisitionSignal?.aborted).toBe(false)
+
+      let disposing: Promise<void>
+      if (stage === 'closing connection') {
+        disposing = resources.dispose()
+        await closeEntered.promise
+        expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+        expect(close).toHaveBeenCalledTimes(1)
+        closeRelease.resolve(undefined)
+      } else {
+        if (stage === 'resident connection') expect(close).not.toHaveBeenCalled()
+        disposing = resources.dispose()
+      }
+      await disposing
+      expect(close).toHaveBeenCalledTimes(1)
+      expect(ctx.agents.retention(a.agent)?.leases).toBe(0)
+      const reclaimable = ctx.agents.sealReclaim(a.agent)
+      expect(reclaimable).toBeDefined()
+      reclaimable?.abort()
+    },
+  )
+
+  it.each(['failed open', 'failed close'] as const)(
+    'keeps the entry and pin when %s leaves owned or unconfirmed resources',
+    async (failure) => {
+      const { ctx, owner } = await fixture()
+      const a = await owner(`failure-${failure}`)
+      const b = await owner(`failure-peer-${failure}`)
+      const open = failure === 'failed open'
+        ? vi.fn().mockRejectedValue(new Error('browser unavailable'))
+        : vi.fn(async () => ({ value: 1, close: async () => { throw new Error('close failed') } }))
+      const resources = new SessionResources<number>(ctx, { label: 'failure', exclusive: true, open })
+      if (failure === 'failed open') {
+        await expect(resources.get(a.agent)).rejects.toThrow('browser unavailable')
+        expect(open).toHaveBeenCalledOnce()
+        expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+        expect(resources.available(a.agent)).toBe(true)
+        await expect(resources.get(a.agent)).rejects.toThrow('browser unavailable')
+        await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+        expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+        expect(open).toHaveBeenCalledOnce()
+      } else {
+        expect(await resources.get(a.agent)).toBe(1)
+        await expect(resources.get(b.agent)).rejects.toThrow('already reserved')
+        await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+        expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+        expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+        expect(resources.available(a.agent)).toBe(false)
+        expect(open).toHaveBeenCalledOnce()
+      }
+      await resources.dispose().catch(() => undefined)
+      await a.dispose()
+    },
+  )
+
+  it('keeps idle reclamation blocked when an unknown child close accompanies a rejected open', async () => {
+    const { ctx, owner } = await fixture()
+    const a = await owner('unconfirmed-close-open')
+    let childAlive = false
+    const open = vi.fn(async () => {
+      childAlive = true
+      // The provider's startup rollback could not confirm that its child exited.
+      throw new AggregateError(
+        [new Error('listTools failed'), new Error('connection close did not confirm child termination')],
+        'browser serving startup failed and its child close was not confirmed',
+      )
+    })
+    const resources = new SessionResources<number>(ctx, { label: 'unconfirmed', exclusive: false, open })
+    expect(await resources.get(a.agent).catch((error: unknown) => error)).toBeInstanceOf(AggregateError)
+    expect(childAlive).toBe(true)
+    // The rejection is not proof of rollback: the owner stays pinned against idle reclamation.
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    expect(resources.available(a.agent)).toBe(true)
+    // Repeated close attempts report the retained unknown outcome instead of releasing the pin.
+    await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+    await expect(resources.dispose()).rejects.toThrow('browser cleanup failed')
+    expect(open).toHaveBeenCalledOnce()
+    expect(childAlive).toBe(true)
+    expect(ctx.agents.retention(a.agent)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(a.agent)).toBeUndefined()
+    await a.dispose()
+    await resources.dispose().catch(() => undefined)
+  })
+
+  it.each(['get', 'run'] as const)(
+    'rejects sealed %s before open side effects while available reports false',
+    async (method) => {
+      const { ctx, owner } = await fixture()
+      const a = await owner(`sealed-${method}`)
+      const open = vi.fn(async () => ({ value: 1, close: async () => {} }))
+      const resources = new SessionResources<number>(ctx, { label: 'sealed', exclusive: false, open })
+      const ticket = ctx.agents.sealReclaim(a.agent)
+      expect(ticket).toBeDefined()
+      expect(resources.available(a.agent)).toBe(false)
+      if (method === 'get') {
+        await expect(resources.get(a.agent)).rejects.toBeInstanceOf(AgentReclaimingError)
+      } else {
+        expect(() => resources.run(a.agent, new AbortController().signal, async () => 1)).toThrow(AgentReclaimingError)
+      }
+      expect(open).not.toHaveBeenCalled()
+      expect(ctx.agents.retention(a.agent)?.leases).toBe(0)
+      ticket?.abort()
+      expect(resources.available(a.agent)).toBe(true)
+      await a.dispose()
+      await resources.dispose()
+    },
+  )
 })
