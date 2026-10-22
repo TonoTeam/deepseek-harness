@@ -120,47 +120,6 @@ describe('idle eviction through Loader composition', () => {
     expect(Buffer.concat(chunks).toString('utf8')).toBe('durable attachment')
   }, 20_000)
 
-  it('reclaims an Agent created through commands.fork and cold-resumes its durable fork log', async () => {
-    const { ctx, root, fixture } = await boot()
-    const source = await fixture.controller.createSession({ cwd: join(root, 'workspace'), reusable: () => true })
-    source.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'source task' }], source: { kind: 'user' } }))
-    await source.agent.whenIdle()
-    await ctx.sessions.flush(source.agent.session)
-    const attachment = await ctx.attachments.saveFile({ data: new TextEncoder().encode('fork attachment'), name: 'note.txt' })
-
-    const forked = await fixture.commands.fork({ sessionId: source.agent.id })
-    const forkId = forked.sessionId
-    const live = ctx.agents.get(forkId)
-    if (live === undefined) throw new Error('commands.fork did not publish the child Agent')
-    live.followup(createUserMessage({ content: [{ type: 'text', text: 'fork task' }], source: { kind: 'user' } }))
-    await live.whenIdle()
-    await ctx.sessions.flush(live.session)
-    const forkFile = (await jsonlFiles(join(root, 'logs'))).find(file => file.includes(forkId))
-    if (forkFile === undefined) throw new Error('fork JSONL log was not written')
-    const prefix = await readFile(forkFile)
-    const forkText = prefix.toString('utf8')
-    expect(forkText).toContain('source task')
-    expect(forkText).toContain('fork task')
-
-    // The fork path joins the same creator-owned sweep as createSession-created Agents.
-    await new Promise(resolve => setTimeout(resolve, 5))
-    await fixture.controller.sweepIdleAgents()
-    expect(ctx.agents.get(forkId)).toBeUndefined()
-
-    const resumed = await fixture.controller.resolveAgent(forkId)
-    if ('error' in resumed) throw new Error('cold resume of the forked Session failed')
-    expect(resumed.agent.id).toBe(forkId)
-    resumed.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'resumed task' }], source: { kind: 'user' } }))
-    await resumed.agent.whenIdle()
-    await ctx.sessions.flush(resumed.agent.session)
-    const grown = await readFile(forkFile)
-    expect(grown.subarray(0, prefix.length).equals(prefix)).toBe(true)
-    expect(grown.length).toBeGreaterThan(prefix.length)
-    const chunks: Uint8Array[] = []
-    for await (const chunk of ctx.attachments.readFileStream(attachment)) chunks.push(chunk)
-    expect(Buffer.concat(chunks).toString('utf8')).toBe('fork attachment')
-  }, 20_000)
-
   it.each(['success', 'failure'] as const)(
     'keeps a forked child leased through pending workspace attachment (%s) and cold-resumes after release',
     async (attachOutcome) => {
@@ -210,7 +169,7 @@ describe('idle eviction through Loader composition', () => {
       await ctx.sessions.flush(child.session)
       const forkFile = (await jsonlFiles(join(root, 'logs'))).find(file => file.includes(forkId))
       if (forkFile === undefined) throw new Error('fork JSONL log was not written')
-      const prefix = await readFile(forkFile)
+      let prefix = await readFile(forkFile)
 
       settleAttach(attachOutcome === 'failure' ? new Error('workspace attach failed') : undefined)
       const result = await settlement
@@ -222,6 +181,14 @@ describe('idle eviction through Loader composition', () => {
       // The finally release drops the lease on both outcomes; the tracked handle
       // stays reclaimable.
       expect(ctx.agents.retention(child)).toMatchObject({ leases: 0, state: 'open' })
+      if (attachOutcome === 'success') {
+        child.followup(createUserMessage({ content: [{ type: 'text', text: 'fork task' }], source: { kind: 'user' } }))
+        await child.whenIdle()
+        await ctx.sessions.flush(child.session)
+        prefix = await readFile(forkFile)
+        expect(prefix.toString('utf8')).toContain('source task')
+        expect(prefix.toString('utf8')).toContain('fork task')
+      }
       await new Promise(resolve => setTimeout(resolve, 5))
       await fixture.controller.sweepIdleAgents()
       expect(ctx.agents.get(forkId)).toBeUndefined()
