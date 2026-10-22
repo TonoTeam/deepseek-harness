@@ -4,6 +4,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import { ApiSessionAgentController } from '../src/agent.ts'
+import { SessionCommandController } from '../src/commands.ts'
 import { installModelSelectionProjection } from '../src/model-selection-projection.ts'
 
 /** The fixture instance created by the most recent Loader boot. */
@@ -14,6 +15,7 @@ export default class ApiIdleLoaderFixture extends Service {
   static inject = ['agents', 'llm', 'sessionProjections', 'sessionQuery', 'sessions', 'typert']
 
   readonly controller: ApiSessionAgentController
+  readonly commands: SessionCommandController
 
   constructor(ctx: Context) {
     super(ctx, 'apiIdleLoaderFixture')
@@ -24,9 +26,14 @@ export default class ApiIdleLoaderFixture extends Service {
         currentSelection: (): AgentOptions => ({ provider: 'mock', model: 'mock' }),
         saveSelection: () => Promise.resolve(),
       } as never)
+      // Fork resolves workspace placement through this registry; this fixture
+      // tests durability, not workspace membership.
+      ctx.provide('workspaceRegistry', { list: () => [] } as never)
       ctx.llm.registerAdapter(['mock'], new MockAdapter([
         textResponse('first mock answer'),
         textResponse('second mock answer'),
+        textResponse('fork mock answer'),
+        textResponse('resumed mock answer'),
       ]))
       this.controller = new ApiSessionAgentController(ctx, {
         enabled: true,
@@ -35,6 +42,7 @@ export default class ApiIdleLoaderFixture extends Service {
         maxPerSweep: 8,
         reclaimTimeoutMs: 5_000,
       })
+      this.commands = new SessionCommandController(ctx, this.controller, process.cwd())
     } catch (error: unknown) {
       apiIdleLoaderRef.error = error
       throw error

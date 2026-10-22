@@ -9,7 +9,7 @@ import {
   AgentReclaimingError,
 } from '@deepseek-ai/dsh-agent'
 import type {
-  Agent, AgentActivityLease, AgentHandle, AgentOptions, AgentSetup,
+  Agent, AgentActivityLease, AgentHandle, AgentOptions, AgentSetup, CreateAgentOptions,
   ModelSelection as AgentModelSelection, ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
@@ -646,6 +646,20 @@ export class ApiSessionAgentController {
 
   private createMinted(cwd: string, composition: ApiSessionComposition): Promise<Agent> {
     return this.createAgent(brandString<SessionId>(`session-${randomUUID()}`), cwd, composition)
+  }
+
+  /**
+   * Create one forked child and retain its full creator-owned handle.
+   * Fork composes its seeded child directly instead of using the ordinary
+   * create/resume claim path; this method adds the returned handle to the same
+   * idle policy without a second create or resume.
+   * @param options - complete seeded creation options for the child.
+   * @returns the published forked Agent.
+   */
+  async createForkedAgent(options: CreateAgentOptions): Promise<Agent> {
+    const handle = await this.ctx.agents.create(options)
+    this.track(handle)
+    return handle.agent
   }
 
   private async createAgent(sessionId: SessionId, cwd: string, composition: ApiSessionComposition): Promise<Agent> {
