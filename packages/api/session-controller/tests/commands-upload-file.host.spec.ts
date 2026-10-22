@@ -14,6 +14,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import FileUploads from '@deepseek-ai/dsh-client-file-upload'
 import type { FileUploadReceiptId } from '@deepseek-ai/dsh-client-file-upload/types'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import type { Mock } from 'vitest'
 import type { ApiSessionAgentController } from '../src/agent.ts'
 import { SessionCommandController } from '../src/commands.ts'
 import type { SessionRequestId } from '../src/types.ts'
@@ -27,7 +28,7 @@ async function uploadHarness(origin?: 'subagent'): Promise<{
   agent: Agent
   followup: ReturnType<typeof vi.fn>
   saveFile: ReturnType<typeof vi.fn>
-  saveFileStream: ReturnType<typeof vi.fn>
+  saveFileStream: Mock<(input: SaveFileStreamAttachment) => Promise<FileAttachmentRef>>
   saveImages: ReturnType<typeof vi.fn>
   disposeAgent: () => Promise<void>
   uploadRoute: (request: Request) => Promise<Response>
@@ -59,7 +60,7 @@ async function uploadHarness(origin?: 'subagent'): Promise<{
     name: input.name ?? 'file',
     bytes: input.data.byteLength,
   }))
-  const saveFileStream = vi.fn(async (input: SaveFileStreamAttachment): Promise<FileAttachmentRef> => {
+  const saveFileStream = vi.fn<(input: SaveFileStreamAttachment) => Promise<FileAttachmentRef>>(async (input) => {
     let bytes = 0
     for await (const chunk of input.data) bytes += chunk.byteLength
     return {
@@ -96,6 +97,7 @@ async function uploadHarness(origin?: 'subagent'): Promise<{
     resolveAgent: () => Promise.resolve({ agent }),
     selectionFor: () => selection,
     serializeImageAdmission: <Value>(_agent: Agent, operation: () => Promise<Value>) => operation(),
+    withRetainedAgent: <Value>(_sessionId: SessionId, operation: (owned: Agent) => Promise<Value>) => operation(agent),
   } as unknown as ApiSessionAgentController
   const uploads = new FileUploads(ctx)
   if (uploadRoute === undefined) throw new Error('file upload route was not registered')
@@ -259,6 +261,54 @@ describe('Session file uploads', () => {
     expect(() => { uploads.registerAgentResolver(replacement) }).toThrow('already registered')
     expect(disposeReplacement).toBeTypeOf('function')
     disposeReplacement()
+  })
+
+  it('leases the exact Agent through stream storage and pins the staged receipt until retirement', async () => {
+    const { ctx, uploads, agent, disposeAgent, saveFileStream } = await uploadHarness()
+    await disposeAgent()
+    const resolveAgent = vi.fn(async () => agent)
+    const borrow = vi.fn(async () => {
+      if (ctx.agents.get(SESSION) !== agent) await ctx.agents.register(agent)
+      const lease = ctx.agents.retain(agent)
+      return { value: agent, release: () => { lease.release() } }
+    })
+    const disposeResolver = uploads.registerAgentResolver(resolveAgent, borrow)
+    const streamStarted = Promise.withResolvers<undefined>()
+    const finishStream = Promise.withResolvers<undefined>()
+    saveFileStream.mockImplementationOnce(() => {
+      streamStarted.resolve(undefined)
+      return finishStream.promise.then(() => ({
+        attachmentId: AttachmentId(`sha256:${'ef'.repeat(32)}`),
+        name: 'late.bin',
+        bytes: 1,
+      }))
+    })
+    const upload = () => uploads.uploadStream({
+      sessionId: SESSION,
+      data: (async function* (): AsyncIterable<Uint8Array> { yield Uint8Array.of(1) })(),
+    })
+    const uploading = upload()
+    await streamStarted.promise
+    // The exact lease spans the real storage stream, not only its call setup.
+    expect(borrow).toHaveBeenCalledWith(SESSION)
+    expect(ctx.agents.retention(agent)?.leases).toBe(1)
+    finishStream.resolve(undefined)
+    const receipt = await uploading
+    expect(resolveAgent).not.toHaveBeenCalled()
+    // The upload stream ended; its exact lease was replaced by the receipt
+    // pin, so a long wait before prompt admission cannot reclaim the owner.
+    expect(ctx.agents.retention(agent)?.leases).toBe(1)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(uploads.resolve(agent, receipt.receiptId)).toBeDefined()
+    uploads.bindPrompt(agent, [receipt.receiptId], 'req-1')
+    uploads.retirePrompt(agent, 'req-1')
+    expect(ctx.agents.retention(agent)?.leases).toBe(0)
+    expect(uploads.resolve(agent, receipt.receiptId)).toBeUndefined()
+
+    saveFileStream.mockRejectedValueOnce('disk offline')
+    await expect(upload()).rejects.toMatchObject({ code: 'gateway/internal' })
+    expect(ctx.agents.retention(agent)?.leases).toBe(0)
+    disposeResolver()
   })
 
   it('rejects a cold upload when no Agent resolver is registered', async () => {

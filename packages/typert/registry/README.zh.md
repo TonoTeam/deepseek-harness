@@ -51,6 +51,8 @@ Harness 离线集成在各自的 profile Context 中通过 `ctx.typert.remotes.r
 
 Remote 调用通过 `ctx.typert.lookups` 与 `ctx.typert.contexts` 解析 Host 对象与作用域 Context。`registerHost()` 安装 Host wire 声明及其 wire 到 Context 的 resolver，`configureHost()` 只替换该 resolver。`registerClient()` 为同一个 merge-declared kind 安装双向 Client adapter。Host 到 Client 的事件源显式携带领域 identity，而不从 Context 反向投影。
 
+lookup provider 或 Host Context adapter 还可声明 Host-only 的可选 `borrow(id)` 能力。`configure()` 与 `configureHost()` 在 resolver 旁接受可选的 borrower。配置的 resolver 拥有该合成视图的获取权：其 borrower 替换 provider 的；不带 borrower 的 override 不暴露任何 borrower——provider 的 borrower 会绕过配置的 resolver 并返回不同的值。合成的 `get()`/`getHost()` 结果原样携带配置的 borrower，wire 声明与 Client face 均不改变。
+
 `ctx.typert.resources` 保存 `TypertResourceMap` 中每个资源种类的默认 wire 字段。拥有该种类的领域以 `register(kind, { field })` 登记，登记是调用方 fiber 的 Cordis effect；同一种类重复登记即抛错，登记内置的无身份资源种类 `global` 同样抛错。`get(kind)` 读取一个种类的声明，`entries()` 按登记顺序列出全部已登记的 `{ kind, field }`。lookup provider 与 Host Context adapter 可经 `resource` 声明其 wire 身份所属的资源种类，配置的 resolver 保留该声明。Gateway 解析非 owner 调用的资源时读取这三者。
 
 -----

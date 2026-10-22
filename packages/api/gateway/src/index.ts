@@ -31,6 +31,7 @@ import {
   type RemoteAccessResource,
   type RemoteInvocation,
   type RemoteMethodMarker,
+  type TypertBorrowedValue,
   type TypertCodec,
   type TypertGatewayBinding,
 } from '@deepseek-ai/dsh-typert-protocol'
@@ -100,6 +101,8 @@ interface PreparedInvocation {
   readonly args: readonly unknown[]
   readonly method: (...args: never[]) => unknown
   readonly invocation: GatewayInvocation
+  /** Releases every Host borrow acquired while resolving this invocation. */
+  readonly releaseBorrows: () => void
 }
 
 /** Carrier inputs `GatewayInvocation.uplink()` decodes on first use. */
@@ -410,6 +413,11 @@ export class TypertGatewayService extends Service implements TypertGateway {
 
   private async invokePrepared(prepared: PreparedInvocation): Promise<unknown> {
     if (prepared.descriptor.mode !== undefined) {
+      try {
+        await prepared.invocation.close()
+      } finally {
+        prepared.releaseBorrows()
+      }
       throw new TypertGatewayError(
         'gateway/signature-invalid',
         prepared.endpoint,
@@ -423,8 +431,13 @@ export class TypertGatewayService extends Service implements TypertGateway {
       if (prepared.invocation.signal.aborted) throw remoteCancelled(prepared.endpoint, error)
       throw error
     } finally {
-      // A unary call's uplink is readable only while the method runs.
-      await prepared.invocation.close()
+      // A unary call's uplink is readable only while the method runs, and
+      // borrowed Host objects stay pinned until the business method returns.
+      try {
+        await prepared.invocation.close()
+      } finally {
+        prepared.releaseBorrows()
+      }
     }
   }
 
@@ -444,7 +457,11 @@ export class TypertGatewayService extends Service implements TypertGateway {
   private async openStream(request: InvokeRemoteRequest, control: AbortController): Promise<AsyncIterable<unknown>> {
     const prepared = await this.prepareInvocation(request, control)
     if (prepared.descriptor.mode === undefined) {
-      await prepared.invocation.close()
+      try {
+        await prepared.invocation.close()
+      } finally {
+        prepared.releaseBorrows()
+      }
       throw new TypertGatewayError(
         'gateway/signature-invalid',
         prepared.endpoint,
@@ -455,20 +472,26 @@ export class TypertGatewayService extends Service implements TypertGateway {
     try {
       source = Reflect.apply(prepared.method, prepared.receiver, prepared.args) as unknown
     } catch (error) {
-      await prepared.invocation.close()
+      try {
+        await prepared.invocation.close()
+      } finally {
+        prepared.releaseBorrows()
+      }
       if (prepared.invocation.signal.aborted) throw remoteCancelled(prepared.endpoint, error)
       throw error
     }
-    if (!isIterable(source)) {
-      await prepared.invocation.close()
-      throw new TypertGatewayError(
-        'gateway/result-invalid',
-        prepared.endpoint,
-        'stream Remote method did not return Iterable or AsyncIterable',
-        { field: 'result' },
-      )
+    let iteratorFactory: () => SourceIterator
+    try {
+      iteratorFactory = sourceIteratorFactory(source, prepared.endpoint)
+    } catch (error) {
+      try {
+        await prepared.invocation.close()
+      } finally {
+        prepared.releaseBorrows()
+      }
+      throw error
     }
-    return cancellableStream(source, prepared.endpoint, prepared.invocation)
+    return ownedStream(iteratorFactory, prepared.endpoint, prepared.invocation, prepared.releaseBorrows)
   }
 
   private async dispatchRpc(
@@ -807,54 +830,75 @@ export class TypertGatewayService extends Service implements TypertGateway {
         })
       }
     }
-    const receiverContext = await this.resolveReceiverContext(descriptor, validated, endpoint)
-    const receiver: unknown = receiverContext.get(descriptor.service)
-    if (!isObject(receiver)) {
-      throw new TypertGatewayError(
-        'gateway/service-unavailable',
-        endpoint,
-        `active Service ${JSON.stringify(descriptor.service)} is unavailable`,
-      )
+    const borrows: TypertBorrowedValue<unknown>[] = []
+    let released = false
+    const releaseBorrows = (): void => {
+      if (released) return
+      released = true
+      for (let index = borrows.length - 1; index >= 0; index -= 1) {
+        try {
+          borrows[index]?.release()
+        } catch (error: unknown) {
+          this.ctx.logger.error(`api-gateway: Host borrow release failed: ${String(error)}`)
+        }
+      }
     }
-    validateBinding(receiver, descriptor.service, descriptor.namespace, endpoint)
-    const args = await Promise.all(descriptor.parameters.map(parameter =>
-      this.resolveParameter(parameter, validated, endpoint)))
-    const signal = methodSignal(request, control, descriptor.mode === 'stream')
-    const invocation = new GatewayInvocation(
-      { namespace: request.namespace, method: request.method, args: request.args },
-      descriptor.service,
-      request.peer,
-      signal,
-      {
-        source: request.uplink ?? EMPTY_ASYNC_ITERABLE,
-        window: request.uplinkWindow,
-        codec: descriptor.uplink?.codec ?? SRC_JSON_CODEC,
-        endpoint,
-        abort: (reason) => { control.abort(reason) },
-      },
-    )
-    if (descriptor.cancellation !== undefined) args.push(signal)
-    // The method runs on a Service view bound to a Context carrying this call:
-    // Cordis rebinds `this.ctx` to the accessing Context, so `this.ctx.invocation`
-    // is this call and nothing travels through the parameter list. The view
-    // resolves the Service the plain read above already found.
-    const callReceiver = receiverContext.extend({ invocation }).get(descriptor.service) as object
-    const implementation = descriptor.implementation ?? descriptor.method
-    const method: unknown = Reflect.get(callReceiver, implementation)
-    if (typeof method !== 'function') {
-      throw new TypertGatewayError(
-        'gateway/method-unavailable',
-        endpoint,
-        `active Service ${JSON.stringify(descriptor.service)} has no callable method ${JSON.stringify(implementation)}`,
+    try {
+      const receiverContext = await this.resolveReceiverContext(descriptor, validated, endpoint, borrows)
+      const receiver: unknown = receiverContext.get(descriptor.service)
+      if (!isObject(receiver)) {
+        throw new TypertGatewayError(
+          'gateway/service-unavailable',
+          endpoint,
+          `active Service ${JSON.stringify(descriptor.service)} is unavailable`,
+        )
+      }
+      validateBinding(receiver, descriptor.service, descriptor.namespace, endpoint)
+      const args: unknown[] = []
+      for (const parameter of descriptor.parameters) {
+        args.push(await this.resolveParameter(parameter, validated, endpoint, borrows))
+      }
+      const signal = methodSignal(request, control, descriptor.mode === 'stream')
+      const invocation = new GatewayInvocation(
+        { namespace: request.namespace, method: request.method, args: request.args },
+        descriptor.service,
+        request.peer,
+        signal,
+        {
+          source: request.uplink ?? EMPTY_ASYNC_ITERABLE,
+          window: request.uplinkWindow,
+          codec: descriptor.uplink?.codec ?? SRC_JSON_CODEC,
+          endpoint,
+          abort: (reason) => { control.abort(reason) },
+        },
       )
-    }
-    return {
-      endpoint,
-      descriptor,
-      receiver: callReceiver,
-      args,
-      method: method as (...args: never[]) => unknown,
-      invocation,
+      if (descriptor.cancellation !== undefined) args.push(signal)
+      // The method runs on a Service view bound to a Context carrying this call:
+      // Cordis rebinds `this.ctx` to the accessing Context, so `this.ctx.invocation`
+      // is this call and nothing travels through the parameter list. The view
+      // resolves the Service the plain read above already found.
+      const callReceiver = receiverContext.extend({ invocation }).get(descriptor.service) as object
+      const implementation = descriptor.implementation ?? descriptor.method
+      const method: unknown = Reflect.get(callReceiver, implementation)
+      if (typeof method !== 'function') {
+        throw new TypertGatewayError(
+          'gateway/method-unavailable',
+          endpoint,
+          `active Service ${JSON.stringify(descriptor.service)} has no callable method ${JSON.stringify(implementation)}`,
+        )
+      }
+      return {
+        endpoint,
+        descriptor,
+        receiver: callReceiver,
+        args,
+        method: method as (...args: never[]) => unknown,
+        invocation,
+        releaseBorrows,
+      }
+    } catch (error: unknown) {
+      releaseBorrows()
+      throw error
     }
   }
 
@@ -998,6 +1042,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     descriptor: InvocationDescriptor,
     args: Readonly<Record<string, unknown>>,
     endpoint: string,
+    borrows: TypertBorrowedValue<unknown>[],
   ): Promise<Context> {
     if (descriptor.invocation.kind === 'direct') return this.ctx
     const invocation = descriptor.invocation
@@ -1021,7 +1066,16 @@ export class TypertGatewayService extends Service implements TypertGateway {
     const identity = decode(invocation.codec, args[invocation.wire], endpoint, invocation.wire)
     let context: Context | undefined
     try {
-      context = await provider.resolve(identity)
+      // Prefer the owner's borrow capability so the exact Context stays pinned
+      // through the unary method or the stream iterator's real cleanup. A
+      // provider without it keeps its unchanged plain resolution policy.
+      if (provider.borrow !== undefined) {
+        const borrowed = await provider.borrow(identity)
+        borrows.push(borrowed)
+        context = borrowed.value
+      } else {
+        context = await provider.resolve(identity)
+      }
     } catch (cause) {
       if (remoteErrorOf(cause) !== undefined) throw cause
       throw new TypertGatewayError(
@@ -1046,6 +1100,7 @@ export class TypertGatewayService extends Service implements TypertGateway {
     parameter: InvocationParameterDescriptor,
     args: Readonly<Record<string, unknown>>,
     endpoint: string,
+    borrows: TypertBorrowedValue<unknown>[],
   ): Promise<unknown> {
     // Lookup ids are never omissible, so an absent field belongs to a json parameter that takes undefined.
     if (!Object.hasOwn(args, parameter.wire)) return undefined
@@ -1081,7 +1136,13 @@ export class TypertGatewayService extends Service implements TypertGateway {
     }
     let resolved: unknown
     try {
-      resolved = await provider.resolve(value)
+      if (provider.borrow !== undefined) {
+        const borrowed = await provider.borrow(value)
+        borrows.push(borrowed)
+        resolved = borrowed.value
+      } else {
+        resolved = await provider.resolve(value)
+      }
     } catch (cause) {
       if (remoteErrorOf(cause) !== undefined) throw cause
       throw new TypertGatewayError(
@@ -1292,36 +1353,65 @@ function assertPeerLive(peer: PeerScope, endpoint: string): void {
   }
 }
 
-function isIterable(value: unknown): value is Iterable<unknown> | AsyncIterable<unknown> {
-  return isObject(value)
-    && (typeof Reflect.get(value, Symbol.iterator) === 'function'
-      || typeof Reflect.get(value, Symbol.asyncIterator) === 'function')
+/** The protocol iterator a stream Remote method produces, sync or async. */
+type SourceIterator = AsyncIterator<unknown> | Iterator<unknown>
+
+/**
+ * Validate a method result and capture the protocol factories that create its
+ * iterator. Both getters are read once, so validation and creation observe the
+ * same source and a throwing getter stays inside the invocation cleanup path.
+ * @param source - value returned by the Remote method.
+ * @param endpoint - endpoint named in the failure.
+ * @returns a factory for the single business iterator.
+ * @throws {@link TypertGatewayError} `gateway/result-invalid` when the value
+ *   implements neither iteration protocol; a source getter's own error otherwise.
+ */
+function sourceIteratorFactory(source: unknown, endpoint: string): () => SourceIterator {
+  if (isObject(source)) {
+    const asyncFactory: unknown = Reflect.get(source, Symbol.asyncIterator)
+    const syncFactory: unknown = Reflect.get(source, Symbol.iterator)
+    if (typeof asyncFactory === 'function') {
+      return () => Reflect.apply(asyncFactory, source, []) as AsyncIterator<unknown>
+    }
+    if (typeof syncFactory === 'function') {
+      return () => Reflect.apply(syncFactory as (...args: never[]) => Iterator<unknown>, source, [])
+    }
+  }
+  throw new TypertGatewayError(
+    'gateway/result-invalid',
+    endpoint,
+    'stream Remote method did not return Iterable or AsyncIterable',
+    { field: 'result' },
+  )
 }
 
 async function *cancellableStream(
-  source: Iterable<unknown> | AsyncIterable<unknown>,
+  sourceIterator: () => SourceIterator,
   endpoint: string,
   invocation: GatewayInvocation,
+  release: () => void,
 ): AsyncGenerator {
   const { signal } = invocation
-  const asyncFactory: unknown = Reflect.get(source, Symbol.asyncIterator)
-  const syncFactory: unknown = Reflect.get(source, Symbol.iterator)
-  const iterator = typeof asyncFactory === 'function'
-    ? Reflect.apply(asyncFactory, source, []) as AsyncIterator<unknown>
-    : Reflect.apply(syncFactory as (...args: never[]) => Iterator<unknown>, source, [])
+  let iterator: SourceIterator | undefined
+  let pending: Promise<IteratorResult<unknown>> | undefined
   let rejectAbort: ((error: unknown) => void) | undefined
   const onAbort = (): void => {
     rejectAbort?.(streamAbortFailure(endpoint, signal.reason))
   }
   signal.addEventListener('abort', onAbort, { once: true })
   try {
+    iterator = sourceIterator()
     while (true) {
       if (signal.aborted) throw streamAbortFailure(endpoint, signal.reason)
       // Reusing a pending cancellation promise retains every completed race.
       const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
       // next() can abort and throw synchronously before the race subscribes.
       void aborted.catch(() => undefined)
-      const next = await Promise.race([Promise.resolve(iterator.next()), aborted])
+      // Custom iterators need not serialize return() behind a pending next().
+      // Keep the real read so cleanup can wait for it to settle instead of
+      // releasing borrows while the business iterator still runs.
+      pending = Promise.resolve(iterator.next())
+      const next = await Promise.race([pending, aborted])
       rejectAbort = undefined
       if (next.done === true) return
       yield next.value
@@ -1329,10 +1419,140 @@ async function *cancellableStream(
   } finally {
     rejectAbort = undefined
     signal.removeEventListener('abort', onAbort)
-    // The uplink closes first so a method blocked on `uplink.next()` unwinds
-    // before its iterator is asked to return.
-    await invocation.close()
-    await iterator.return?.()
+    try {
+      // The uplink closes first so a method blocked on `uplink.next()` unwinds
+      // before its iterator is asked to return.
+      await invocation.close()
+      await iterator?.return?.()
+    } finally {
+      try {
+        // return() may resolve before a read that lost the abort race. The
+        // lease outlives both, so release only after that read settles.
+        await pending?.catch(() => undefined)
+      } finally {
+        // Borrows outlive the source's asynchronous return cleanup. Releasing
+        // in the generator body before this point would unpin the Agent while
+        // the business iterator still runs.
+        release()
+      }
+    }
+  }
+}
+
+/**
+ * Keep Host borrows for the actual source iterator lifetime. The wrapper covers
+ * cancellation before the first `next()`, where an async generator's body and
+ * `finally` never run, while {@link cancellableStream} owns cleanup for started
+ * streams. Both paths share one memoized source iterator and one lifecycle: once
+ * a close starts, its cleanup promise owns every later terminal operation, and a
+ * completed close never reopens the wrapper or replays a factory, getter,
+ * method, or source `return()`.
+ * @param iteratorFactory - creates the business iterator when the stream starts
+ *   or closes early; called at most once per wrapper iterator.
+ * @param endpoint - canonical endpoint for cancellation failures.
+ * @param invocation - carrier state closed after the source is done.
+ * @param release - releases every acquired borrow exactly once.
+ * @returns an iterable whose cleanup closes the uplink and the source iterator
+ *   before releasing borrows.
+ */
+function ownedStream(
+  iteratorFactory: () => SourceIterator,
+  endpoint: string,
+  invocation: GatewayInvocation,
+  release: () => void,
+): AsyncIterable<unknown> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<unknown> {
+      let source: SourceIterator | undefined
+      const sourceIterator = (): SourceIterator => {
+        // Started iteration and an unstarted close are exclusive per wrapper
+        // iterator, so the factory runs once; the memoized read also keeps a
+        // return-then-next misuse from replaying the business factory.
+        /* v8 ignore next -- the two source paths are exclusive per wrapper iterator */
+        if (source === undefined) source = iteratorFactory()
+        return source
+      }
+      const generator = cancellableStream(sourceIterator, endpoint, invocation, release)
+      const iterator = generator[Symbol.asyncIterator]()
+      // `closing` and `closed` belong to the same terminal owner: `terminal`
+      // settles the one cleanup whether the source was started or never read.
+      let lifecycle: 'unstarted' | 'started' | 'closing' | 'closed' = 'unstarted'
+      let terminal: Promise<void> | undefined
+      // A generator cancelled before its first next() has not entered the
+      // body, so its own finally cannot run. The wrapper closes the carrier
+      // and awaits the real business iterator's cleanup itself; it never calls
+      // next() and never replays the method that allocated the iterator.
+      const closeUnstarted = (): Promise<void> => {
+        if (terminal !== undefined) return terminal
+        lifecycle = 'closing'
+        const closing = (async (): Promise<void> => {
+          try {
+            try {
+              await invocation.close()
+            } finally {
+              await sourceIterator().return?.()
+            }
+          } finally {
+            release()
+            lifecycle = 'closed'
+          }
+        })()
+        terminal = closing.then(() => undefined, () => undefined)
+        return closing
+      }
+      const closeStarted = (operation: Promise<IteratorResult<unknown>>): Promise<IteratorResult<unknown>> => {
+        lifecycle = 'closing'
+        terminal = operation.then(() => undefined, () => undefined)
+        return operation.finally(() => { lifecycle = 'closed' })
+      }
+      const awaitTerminal = async (): Promise<void> => {
+        // The initiating close owns cleanup failure reporting; a terminal read
+        // only waits for the same cleanup before it reports the stream done.
+        await terminal
+      }
+      return {
+        next: async (value?: unknown) => {
+          if (lifecycle === 'closed') return { done: true, value: undefined }
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
+            return { done: true, value: undefined }
+          }
+          lifecycle = 'started'
+          const result = await iterator.next(value)
+          if (result.done === true) {
+            // A concurrent close owns the same cleanup; let it settle first so
+            // its terminal reads cannot bypass an in-flight release.
+            await terminal
+            lifecycle = 'closed'
+          }
+          return result
+        },
+        return: async (value?: unknown) => {
+          if (lifecycle === 'closed') return { done: true, value }
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
+            return { done: true, value }
+          }
+          if (lifecycle === 'unstarted') {
+            await closeUnstarted()
+            return { done: true, value }
+          }
+          return closeStarted(iterator.return(value))
+        },
+        throw: async (error?: unknown) => {
+          if (lifecycle === 'closed') throw error
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
+            throw error
+          }
+          if (lifecycle === 'unstarted') {
+            await closeUnstarted()
+            throw error
+          }
+          return closeStarted(iterator.throw(error))
+        },
+      }
+    },
   }
 }
 

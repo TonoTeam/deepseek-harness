@@ -16,12 +16,15 @@ import type {
   AgentFactory,
   AgentHandle,
   AgentOptions,
+  AgentReclaimCapability,
+  AgentReclaimOptions,
   AgentSetup,
   CreateAgentOptions,
   ResumeAgentOptions,
   SessionStartSource,
   TurnBoundaryProjection,
 } from '@deepseek-ai/dsh-agent'
+import { AgentReclaimTeardownError } from '@deepseek-ai/dsh-agent'
 import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { interruptedTurnClosers, SessionLogOffset, SessionPreparation, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
@@ -643,6 +646,100 @@ export class AgentLoop extends Service implements AgentFactory {
       if (machine === undefined) throw new Error(`agent "${id}" lifecycle did not construct its driver`)
       const agent = machine
       assertLive()
+      const reclaim: AgentReclaimCapability = {
+        idleSince: () => agent.idleSince(),
+        tryReclaim: async (check: (signal: AbortSignal) => Promise<boolean>, options?: AgentReclaimOptions) => {
+          if (agent.idleSince() === undefined) return { kind: 'busy', reason: 'active' }
+          const ticket = loopCtx.agents.sealReclaim(agent)
+          if (ticket === undefined) return { kind: 'busy', reason: 'leases' }
+          // Every bound converges on one halt: owner abort, seal abort, or
+          // timeout. A hung proof or flush can therefore never hold admission
+          // sealed, and a result arriving after the halt must not commit.
+          const halt = new AbortController()
+          const unlink: Array<() => void> = []
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const isHalted = (): boolean => halt.signal.aborted
+          const follow = (signal: AbortSignal | undefined): void => {
+            if (signal === undefined) return
+            if (signal.aborted) {
+              halt.abort()
+              return
+            }
+            const onAbort = (): void => { halt.abort() }
+            signal.addEventListener('abort', onAbort, { once: true })
+            unlink.push(() => { signal.removeEventListener('abort', onAbort) })
+          }
+          // Nothing can abort `halt` before this listener is attached, so the
+          // race promise always settles through the signal.
+          const HALTED = Symbol('halted')
+          const halted = new Promise<typeof HALTED>((resolve) => {
+            halt.signal.addEventListener('abort', () => { resolve(HALTED) }, { once: true })
+          })
+          // A raced promise that loses may still settle later; observe it so
+          // the late rejection never surfaces as an unhandled rejection.
+          const raceHalt = <T>(work: Promise<T>): Promise<T | typeof HALTED> => {
+            void work.catch(() => {})
+            return Promise.race([work, halted])
+          }
+          const liveReason = (): 'active' | 'background' =>
+            loopCtx.agents.retention(agent) === undefined ? 'active' : 'background'
+          // Everything reversible stays inside this try so every early return
+          // clears the timeout and unlinks the abort listeners.
+          try {
+            follow(ticket.signal)
+            follow(options?.signal)
+            if (options?.timeoutMs !== undefined) {
+              timer = setTimeout(() => { halt.abort() }, options.timeoutMs)
+            }
+            if (isHalted()) {
+              ticket.abort()
+              return { kind: 'busy', reason: 'background' }
+            }
+            const proof = await raceHalt(Promise.resolve().then(() => check(ticket.signal)))
+            if (proof !== true) {
+              ticket.abort()
+              return { kind: 'busy', reason: liveReason() }
+            }
+            if (loopCtx.agents.retention(agent) === undefined) {
+              ticket.abort()
+              return { kind: 'busy', reason: 'active' }
+            }
+            const flushed = await raceHalt(loopCtx.sessions.flush(session))
+            if (flushed === HALTED) {
+              ticket.abort()
+              return { kind: 'busy', reason: liveReason() }
+            }
+            if (!flushed) {
+              ticket.abort()
+              return { kind: 'busy', reason: 'persistence' }
+            }
+            if (isHalted()) {
+              ticket.abort()
+              return { kind: 'busy', reason: liveReason() }
+            }
+            ticket.commit()
+          } catch (error: unknown) {
+            // Guard and flush failures are reversible: restore the same Agent.
+            ticket.abort()
+            // An owner teardown that raced this seal already decided the
+            // lifecycle; its later close failure is not a reclaim alarm.
+            if (loopCtx.agents.retention(agent) === undefined) return { kind: 'busy', reason: 'active' }
+            throw error
+          } finally {
+            if (timer !== undefined) clearTimeout(timer)
+            for (const unlinkSignal of unlink) unlinkSignal()
+          }
+          // The seal is irreversible from here: an unknown teardown outcome
+          // quarantines the identity instead of silently cold-replacing it.
+          try {
+            await dispose()
+            return { kind: 'reclaimed' }
+          } catch (error: unknown) {
+            loopCtx.agents.quarantine(agent)
+            throw new AgentReclaimTeardownError(agent.id, error)
+          }
+        },
+      }
 
       return {
         agent,
@@ -659,7 +756,8 @@ export class AgentLoop extends Service implements AgentFactory {
             assertLive()
             await loopCtx.agents.announce(agent, source, abort.signal)
             assertLive()
-            return { agent, dispose }
+            agent.markPublished()
+            return { agent, dispose, reclaim }
           } finally {
             publication.resolve()
             publication = undefined

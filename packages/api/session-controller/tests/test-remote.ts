@@ -32,7 +32,7 @@ import {
   type RemoteResult,
 } from '@deepseek-ai/dsh-typert-protocol'
 import RemoteAccessService from '@deepseek-ai/dsh-api-remote-access'
-import SessionController from '../src/index.ts'
+import SessionController, { type IdleEvictionDeploymentConfig } from '../src/index.ts'
 import type {
   ModelCatalog,
   SessionAttachmentRequest,
@@ -98,6 +98,8 @@ export interface TestSessionRemoteDefaults {
   readonly defaultModelSelection: () => AgentModelSelection
   readonly cwd: string
   readonly nativeOpen?: boolean
+  /** Opt-in idle reclamation policy used by retention-race regressions. */
+  readonly idleEviction?: IdleEvictionDeploymentConfig
   readonly saveDefaultModelSelection?: (selection: AgentModelSelection) => void | Promise<void>
   readonly openPath?: (path: string, signal: AbortSignal) => Promise<void>
   readonly fileApplications?: SessionControllerInternals['fileApplications']
@@ -299,6 +301,7 @@ function installControllers(
       ctx,
       {
         ...defaults.nativeOpen === undefined ? {} : { nativeOpen: defaults.nativeOpen },
+        ...defaults.idleEviction === undefined ? {} : { idleEviction: defaults.idleEviction },
       },
       {
         ...defaults.openPath === undefined ? {} : { openPath: defaults.openPath },

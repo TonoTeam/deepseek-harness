@@ -2,7 +2,7 @@
  * @module @deepseek-ai/dsh-subagent/activation
  */
 
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import { finalAssistantOutput } from './assistant-output.ts'
@@ -11,6 +11,58 @@ import type { ActivationObserver } from './lifecycle.ts'
 import { SubagentError } from './error.ts'
 import type { StructuredAttachment } from './structured.ts'
 import type { SubagentResult, SubagentRun } from './types.ts'
+
+/**
+ * Single lifetime owner for the exact-Agent usage leases of one parent lineage.
+ *
+ * The direct parent and every live ancestor observed when an activation is
+ * admitted are retained together, so an unknown descendant keeps its whole
+ * ancestor chain pinned. Ordinary release happens once the activation's
+ * settlement notice is queued. A failed disposal or child teardown leaves the
+ * descendant's stop unknown; that outcome retains every lease permanently
+ * because a settled result can precede backend process shutdown and therefore
+ * never proves the descendant stopped. Release requests from every rollback
+ * layer then become no-ops, so idle reclamation cannot reclaim any ancestor.
+ * Resolving that unknown state is an operator action, not an automatic
+ * transition.
+ */
+export class ParentLease {
+  private readonly leases: readonly AgentActivityLease[]
+  private released = false
+  private unconfirmed = false
+
+  /**
+   * Take ownership of the exact-Agent usage leases for one parent lineage.
+   * @param leases - leases acquired from the agent registry, direct parent first.
+   */
+  constructor(leases: readonly AgentActivityLease[]) {
+    this.leases = [...leases]
+  }
+
+  /**
+   * Release every lineage lease unless an earlier failure left the descendant's
+   * stop unconfirmed. Subsequent calls are no-ops.
+   */
+  release(): void {
+    if (this.released || this.unconfirmed) return
+    this.released = true
+    for (const lease of this.leases) lease.release()
+  }
+
+  /**
+   * Permanently retain every lineage lease after a teardown whose outcome is unknown.
+   *
+   * A rejected provider start or native create/resume may have begun side
+   * effects without confirming their cleanup. Disposal rejection, rollback
+   * failure, and child-teardown failure likewise leave open whether the child
+   * still runs. Result settlement or cancellation is not stop proof, so these
+   * leases are never released automatically; an operator must confirm the
+   * descendant stopped before any ancestor can be reclaimed.
+   */
+  markUnconfirmed(): void {
+    this.unconfirmed = true
+  }
+}
 
 /** Process-local slots shared through uninterrupted continuable parent links. */
 export class ActivationPool {
@@ -47,6 +99,14 @@ interface ActivationBase {
   /** The durable child this Activation is an epoch of. */
   readonly childId: SessionId
   readonly parent: Agent
+  /**
+   * Exact-parent-and-ancestor usage leases acquired before preparation or
+   * materialization. One set covers the whole lineage across startup,
+   * execution, cleanup, and settlement notification; it is released after the
+   * parent result has been queued only when cleanup was confirmed, and is
+   * retained permanently after an unknown teardown.
+   */
+  readonly parentLease: ParentLease
   readonly delivery: 'parent' | 'caller'
   readonly result: PromiseWithResolvers<SubagentResult>
   /** Published synchronously before teardown; subsequent callers share this transaction. */

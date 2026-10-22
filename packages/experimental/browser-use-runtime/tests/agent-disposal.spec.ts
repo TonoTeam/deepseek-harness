@@ -82,10 +82,13 @@ it('disposes an initializing browser after its first caller was already user-can
     await disposing
     expect(execute).not.toHaveBeenCalled()
     expect(ctx.agents.get(owner.agent.id)).toBeUndefined()
+    // The canceled acquisition settled as a failure, so service teardown
+    // reports it instead of treating the entry as an empty successful close.
+    await expect(resources.dispose()).rejects.toThrow('initializing-browser: browser cleanup failed')
   } finally {
     rollback.resolve(undefined)
-    await resources.dispose()
-    await disposing
+    await resources.dispose().catch(() => undefined)
+    await disposing?.catch(() => undefined)
     await ctx.fiber.dispose()
   }
 })

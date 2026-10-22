@@ -56,6 +56,8 @@ The limit counts the exact owner's `running` and `stopping` records; all unowned
 
 Jobs belong to their owner and backend, not to the producer tool, so producer or controller reloads do not stop them. When an agent that owns jobs is disposed, its jobs are cancelled, their producers awaited, and their snapshots removed; service disposal does the same for every remaining job. A cancellation that throws during teardown force-fails the record and warns that the work may be orphaned, so teardown never deadlocks.
 
+Every owned record also holds an exact-owner usage lease from before the producer's `run()` until the record is removed. Running, stopping, and settled-but-unread records stay pinned, so idle reclamation never observes the owner as idle or cancels a background job; a sealed or retired owner rejects the start before the producer runs. Unowned work takes no lease, and a failed start releases its lease.
+
 ### Session timing records
 
 Owned jobs record registration and settlement in their original Session, independently of model output collection. SDK consumers receive the same events through `session.event`; the [jobs reference](../../../docs/subsystems/jobs.md#session-lifecycle-records) defines identities, timestamps, and producer settlement reports. Events already persisted remain available after process exit; live jobs and output rings are not resumed.

@@ -460,7 +460,7 @@ describe('Session MCP Loader composition', () => {
     expect(JSON.stringify(model.requests[0]?.messages)).toContain(TOOL)
   })
 
-  it('cancels creation during discovery, closes its process, and releases the attachment', async () => {
+  it('cancels creation during discovery, closes its process, and keeps the attachment pinned', async () => {
     const { ctx, root, model } = await load(true, 'gate')
     const controller = new AbortController()
     let initializing!: Agent
@@ -487,8 +487,12 @@ describe('Session MCP Loader composition', () => {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
     }
     await writeFile(join(root, 'release'), '')
+    // The canceled startup's rejected acquisition keeps its entry and pin: the
+    // provider cannot prove the child exit, so the attachment needs operator
+    // teardown instead of automatic reattachment.
     const successor = await ctx.agents.create({ sessionId: initializing.id })
-    expect((await execute(ctx, successor.agent)).isError).toBe(false)
+    expect(ctx.tools.schemas(successor.agent).some(tool => tool.name === TOOL)).toBe(false)
+    expect((await execute(ctx, successor.agent)).isError).toBe(true)
   })
 
   it('closes the discovered client when a later creation listener rejects', async () => {
@@ -562,7 +566,7 @@ describe('Session MCP Loader composition', () => {
     await resumed.dispose()
   })
 
-  it('awaits discovery on persisted resume and releases a canceled resume before retry', async () => {
+  it('awaits discovery on persisted resume and keeps a canceled resume pinned after failure', async () => {
     const { ctx, root, model } = await load(true, 'gate')
     await ctx.plugin(JsonlSessionPersistence, { root: join(root, 'sessions') })
     await writeFile(join(root, 'release'), '')
@@ -595,18 +599,13 @@ describe('Session MCP Loader composition', () => {
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
     }
 
-    let resumed = false
-    const resuming = ctx.agents.resume({ resumeSessionId: sessionId }).then((handle) => {
-      resumed = true
-      return handle
-    })
-    await vi.waitFor(async () => { expect((await events(root)).filter(event => event.event === 'probe')).toHaveLength(3) })
-    expect(resumed).toBe(false)
+    // The canceled resume's rejected acquisition keeps its entry and pin, so a
+    // retry is admitted without browser tools rather than reconnecting.
+    const owner = await ctx.agents.resume({ resumeSessionId: sessionId })
+    expect((await events(root)).filter(event => event.event === 'probe')).toHaveLength(2)
     expect(model.requests).toHaveLength(2)
-    await writeFile(join(root, 'release'), '')
-    const owner = await resuming
-    expect(ctx.tools.schemas(owner.agent).some(tool => tool.name === TOOL)).toBe(true)
-    expect((await execute(ctx, owner.agent)).content).toEqual([{ type: 'text', text: 'Visit 1: direct' }])
+    expect(ctx.tools.schemas(owner.agent).some(tool => tool.name === TOOL)).toBe(false)
+    expect((await execute(ctx, owner.agent)).isError).toBe(true)
     await owner.dispose()
   })
 

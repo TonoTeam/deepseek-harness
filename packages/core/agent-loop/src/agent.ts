@@ -99,6 +99,10 @@ export class ReactLoopAgent implements Agent {
   readonly inbox: ReactLoopInbox
   private phase: Phase
   private activityDone: Promise<void> = Promise.resolve()
+  /** Latest real transition into complete idle; drives TTL from quiescence, not prompt time. */
+  private quiescentSince = Date.now()
+  /** Publication instant; absent until creation/resume announcements settle. */
+  private publishedAt: number | undefined
 
   /** The agent-scoped registration boundary; the lifecycle owner unwinds it after the driver exits. */
   readonly scope: Scope
@@ -129,7 +133,15 @@ export class ReactLoopAgent implements Agent {
     this.dispatch = agentEvents(loopCtx, this)
     this.scope = createScope(loopCtx, this)
     this.ctx = this.scope.ctx
-    this.inbox = new ReactLoopInbox(this.ctx.sessionProjections, session, this.dispatch)
+    this.inbox = new ReactLoopInbox(
+      this.ctx.sessionProjections,
+      session,
+      this.dispatch,
+      () => { this.loopCtx.agents.assertAcceptsWork(this) },
+      // Pending input hides idle eligibility; clearing it is the latest use,
+      // so the conservative TTL start moves with every committed mutation.
+      () => { this.quiescentSince = Date.now() },
+    )
     /* v8 ignore next -- the loop registers its own turnBoundary unit, so the key is always present */
     const lastTurn = this.loopCtx.sessionProjections.stateOf(session, 'turnBoundary')?.lastTurn ?? 0
     this.phase = { kind: 'idle', lastTurn }
@@ -145,13 +157,37 @@ export class ReactLoopAgent implements Agent {
   private setPhase(next: Phase): void {
     const previousStatus = this.status
     this.phase = next
+    if (next.kind === 'idle') this.quiescentSince = Date.now()
     const status = this.status
     if (status !== previousStatus) {
       this.dispatch.emit('agent/status', { status })
     }
   }
 
+  /**
+   * Record that creation/resume announcement settled and the owner may reclaim
+   * this lifecycle. Publication itself withholds idle eligibility; the timer
+   * starts here rather than at construction or during creation listeners.
+   */
+  markPublished(): void {
+    this.publishedAt = Date.now()
+  }
+
+  /**
+   * True quiescence timestamp for owner reclamation. Maintenance, running
+   * turns, pending input, active leases, and unsettled publication all
+   * withhold it.
+   * @returns epoch milliseconds of the latest true idle start, or undefined.
+   */
+  idleSince(): number | undefined {
+    if (this.publishedAt === undefined || this.phase.kind !== 'idle' || this.inbox.hasPending) return undefined
+    const retention = this.loopCtx.agents.retention(this)
+    if (retention === undefined || retention.state !== 'open' || retention.leases !== 0) return undefined
+    return Math.max(this.quiescentSince, retention.lastLeaseReleaseAt, this.publishedAt)
+  }
+
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
+    this.loopCtx.agents.assertAcceptsWork(this)
     // Waking input cannot join an aborted activity, so it starts the next turn.
     // Captured before the insertion so a reentrant cancel from a splice observer cannot reclassify it.
     const wakingAfterAbort = wakeup && this.phase.kind !== 'idle' && this.phase.abort.signal.aborted
@@ -181,6 +217,7 @@ export class ReactLoopAgent implements Agent {
   }
 
   runMaintenance<T>(job: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.loopCtx.agents.assertAcceptsWork(this)
     if (this.phase.kind !== 'idle') throw new Error(`agent "${this.id}" already has active work`)
     const done = Promise.withResolvers<void>()
     const maintenance: Phase = {

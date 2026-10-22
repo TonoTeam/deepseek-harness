@@ -13,7 +13,7 @@
 import { randomUUID } from 'node:crypto'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease } from '@deepseek-ai/dsh-agent'
 import { ScopedLayers, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout'
@@ -82,6 +82,12 @@ interface TrackedJob {
   outputLimitBytes: number | undefined
   /** Exact lifecycle owner; session-id authorization is derived from it. */
   owner: Agent | undefined
+  /**
+   * Exact-owner usage lease acquired before the producer starts and released
+   * only when this record is dropped. It pins idle reclamation through
+   * running, stopping, and settled-but-unread states alike.
+   */
+  lease: AgentActivityLease | undefined
   cancel: (reason?: string) => void
   status: JobStatus
   ring: OutputRing
@@ -215,13 +221,25 @@ export class LocalJobRegistry extends JobRegistry {
       && (!Number.isSafeInteger(spec.outputLimitBytes) || spec.outputLimitBytes <= 0)) {
       throw new Error(`invalid outputLimitBytes: expected a positive safe integer, got ${JSON.stringify(spec.outputLimitBytes)}`)
     }
-    if (owner !== undefined) this.ensureOwnerCleanup(owner)
-
     const active = this.activeJobCount(owner)
     if (active >= this.maxConcurrentJobsPerOwner) {
       throw new Error(
         `background job limit reached for this owner (limit: ${this.maxConcurrentJobsPerOwner}); use job_kill to stop an unneeded job, wait for it to finish, then retry`,
       )
+    }
+
+    // Acquire before the producer can have any side effect. `retain` also
+    // rejects a sealed, quarantined, or retired exact owner here; the lease is
+    // then held until this record is dropped, including settled-but-unread.
+    let lease: AgentActivityLease | undefined
+    if (owner !== undefined) {
+      lease = this.retainOwner(owner)
+      try {
+        this.ensureOwnerCleanup(owner)
+      } catch (error: unknown) {
+        lease.release()
+        throw error
+      }
     }
 
     // The producer uses the same short UUID identity as controls and durable lifecycle records.
@@ -238,7 +256,15 @@ export class LocalJobRegistry extends JobRegistry {
       append: (text, options) => { this.appendRing(state, ring, text, options, 'producer') },
       updateProgress: (line) => { this.updateProgress(state, line) },
     }
-    const hooks = spec.run(handle)
+    let hooks: ReturnType<JobSpec['run']>
+    try {
+      hooks = spec.run(handle)
+    } catch (error: unknown) {
+      // A producer that fails synchronously never commits a record, so its
+      // owner lease must not outlive the failed start.
+      lease?.release()
+      throw error
+    }
 
     let markSettled!: () => void
     const settled = new Promise<void>((resolve) => { markSettled = resolve })
@@ -249,6 +275,7 @@ export class LocalJobRegistry extends JobRegistry {
       label: spec.label,
       outputLimitBytes: spec.outputLimitBytes,
       owner,
+      lease,
       cancel: hooks.cancel.bind(hooks),
       status: 'running',
       ring,
@@ -369,6 +396,22 @@ export class LocalJobRegistry extends JobRegistry {
       throw new Error(`session "${session}" has no live agent (background job owner must be live)`)
     }
     return owner
+  }
+
+  /**
+   * Take the exact-owner usage lease that pins this record against idle
+   * reclamation. The agent registry is the only source of a live owner, so
+   * retention is available exactly when owned work is; unowned records take no
+   * lease and a composition without that registry cannot invent ownership.
+   * @param owner - exact live Agent resolved for this registration.
+   * @returns the lease released only when the record is dropped.
+   */
+  private retainOwner(owner: Agent): AgentActivityLease {
+    const agents = this.selfCtx.get('agents')
+    if (agents === undefined) {
+      throw new Error('background job ownership requires the agent registry (load @deepseek-ai/dsh-agent)')
+    }
+    return agents.retain(owner)
   }
 
   /**
@@ -663,6 +706,8 @@ export class LocalJobRegistry extends JobRegistry {
   private drop(jobs: readonly TrackedJob[]): void {
     for (const job of jobs) {
       this.store.delete(job.id)
+      job.lease?.release()
+      job.lease = undefined
       this.emit({ type: 'removed', job: this.view(job) }, job.owner)
     }
   }

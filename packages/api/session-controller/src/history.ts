@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { Deque } from '@deepseek-ai/dsh-deque'
+import type { AgentActivityLease } from '@deepseek-ai/dsh-agent'
 import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import {
   isAppendSurfaceEvent,
@@ -50,11 +51,14 @@ export class SessionHistoryController {
 
   /**
    * @param ctx - Host context carrying Session query and projection services.
-   * @param promote - starts ordinary Session activation after snapshot delivery.
+   * @param promote - starts ordinary Session activation after snapshot delivery;
+   *   an activation that returns its exact-Agent lease is released with the follower.
    */
   constructor(
     private readonly ctx: Context,
-    private readonly promote: (observation: SessionObservation) => void,
+    private readonly promote: (
+      observation: SessionObservation,
+    ) => void | Promise<AgentActivityLease | undefined>,
   ) {
     ctx.on('agent/assistant-stream', ({ agent, frame }) => {
       let stream = this.assistantStreams.get(agent.session.id)
@@ -79,9 +83,7 @@ export class SessionHistoryController {
    * @returns unavailable for nonresident Sessions, otherwise identity and inclusive log cut.
    */
   head(request: SessionHeadRequest): SessionHeadValue {
-    if (request.address.kind !== 'session'
-      || typeof request.address.sessionId !== 'string'
-      || request.address.sessionId.length === 0) {
+    if (request.address.sessionId.length === 0) {
       throw new RemoteError('gateway/bad-request', 'head requires an exact session address', {})
     }
     const session = this.ctx.sessions.get(request.address.sessionId)
@@ -209,6 +211,14 @@ export class SessionHistoryController {
       }, { global: true })
     const onAbort = (): void => { notify() }
     signal.addEventListener('abort', onAbort, { once: true })
+    let followerClosed = false
+    let promotion: Promise<AgentActivityLease | undefined> | undefined
+    let promotionLease: AgentActivityLease | undefined
+    const adoptPromotion = (lease: AgentActivityLease | undefined): void => {
+      if (lease === undefined) return
+      if (followerClosed) lease.release()
+      else promotionLease = lease
+    }
     try {
       using source = await this.sourceFor(address, signal, true)
       const events = source.events
@@ -236,11 +246,15 @@ export class SessionHistoryController {
         ...assistantStream === undefined ? {} : { assistantStream },
       }
       if (address.kind === 'session' && source.source === 'prepared') {
-        const promotion = source.retain()
+        const retained = source.retain()
         try {
-          this.promote(promotion)
+          const settlement = this.promote(retained)
+          if (settlement !== undefined) {
+            promotion = Promise.resolve(settlement)
+            promotion.then(adoptPromotion, () => undefined)
+          }
         } catch (error: unknown) {
-          promotion[Symbol.dispose]()
+          retained[Symbol.dispose]()
           throw error
         }
       }
@@ -266,11 +280,14 @@ export class SessionHistoryController {
         yield entryFor(item.event)
       }
     } finally {
+      followerClosed = true
       this.closeFollowers.delete(close)
       signal.removeEventListener('abort', onAbort)
       disposeCreated()
       disposeEvent()
       disposeAssistantStream?.()
+      promotionLease?.release()
+      promotionLease = undefined
     }
   }
 

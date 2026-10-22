@@ -160,6 +160,126 @@ export interface ResumeAgentOptions {
 export interface AgentHandle {
   agent: Agent
   dispose(): Promise<void>
+  /**
+   * Owner-only idle reclamation capability. Supplied only by the native loop
+   * factory; absent for providers that cannot prove phase quiescence, in
+   * which case callers skip reclamation rather than guess.
+   */
+  readonly reclaim?: AgentReclaimCapability
+}
+
+/**
+ * Exact-Agent admission state owned by the registry. `sealed` rejects new
+ * work and leases; `quarantined` additionally records an unknown teardown
+ * outcome, so owners must not automatically resume or replace the identity.
+ */
+export type AgentRetentionState = 'open' | 'sealed' | 'quarantined'
+
+/** One authoritative exact-Agent activity snapshot. */
+export interface AgentRetention {
+  /** Unreleased usage leases. */
+  readonly leases: number
+  /** Conservative timestamp of the most recent lease release. */
+  readonly lastLeaseReleaseAt: number
+  /** Admission state for this exact lifecycle. */
+  readonly state: AgentRetentionState
+  /** Time this snapshot was taken. */
+  readonly observedAt: number
+}
+
+/** Synchronous exact-Agent usage lease; {@link AgentActivityLease.release} is idempotent. */
+export interface AgentActivityLease {
+  /**
+   * Release this lease exactly once. Further calls are no-ops, including
+   * after the owning Agent has left the registry.
+   */
+  release(): void
+}
+
+/**
+ * Owner capability that seals one exact lifecycle, evaluates background
+ * admission under the seal, flushes persistence, and then runs the ordinary
+ * owner teardown. A refused check or failed flush unseals the same live Agent.
+ */
+export interface AgentReclaimCapability {
+  /**
+   * True quiescence start: the latest real phase transition to idle, inbox
+   * mutation, or usage-lease release. Undefined while any work, pending inbox
+   * input, maintenance, publication, or active lease remains.
+   * @returns epoch milliseconds of the idle start, or undefined when not idle.
+   */
+  idleSince(): number | undefined
+  /**
+   * Atomically seal admission, then evaluate `check` under the seal. A false
+   * check or failed flush restores the same live Agent; only an accepted
+   * check and a participating durable flush proceed to irreversible teardown.
+   * The check receives the seal signal, which aborts when the owner tears the
+   * lifecycle down or the caller-supplied {@link AgentReclaimOptions.signal}
+   * or timeout fires, so a hung proof or flush cannot hold admission sealed forever.
+   * @param check - background-activity proof awaited while admission is sealed.
+   * @param options - optional owner abort and timeout bounds for the proof and durable flush.
+   * @returns the discriminated outcome; `busy` never tears the Agent down.
+   */
+  tryReclaim(
+    check: (signal: AbortSignal) => Promise<boolean>,
+    options?: AgentReclaimOptions,
+  ): Promise<AgentReclaimOutcome>
+}
+
+/** Optional bounds for the background-activity proof of {@link AgentReclaimCapability.tryReclaim}. */
+export interface AgentReclaimOptions {
+  /** Owner cancellation; aborting restores the same live Agent's admission. */
+  readonly signal?: AbortSignal
+  /** Maximum time to await the proof and durable flush; expiry restores admission with a `background` refusal. */
+  readonly timeoutMs?: number
+}
+
+/**
+ * Discriminated owner reclamation result. `persistence` means no durability
+ * listener participated, so the session has no claimed recovery point; the
+ * same live Agent stays admitted. Teardown errors are thrown instead, as
+ * {@link AgentReclaimTeardownError}.
+ */
+export type AgentReclaimOutcome =
+  | { readonly kind: 'reclaimed' }
+  | { readonly kind: 'busy'; readonly reason: 'active' | 'leases' | 'background' | 'persistence' }
+
+/** Raised when work or a lease reaches an exact Agent after its admission sealed. */
+export class AgentReclaimingError extends Error {
+  /** @param id - the sealed Agent identity. */
+  constructor(readonly id: SessionId) {
+    super(`agent "${id}" is being reclaimed and does not accept new work`)
+    this.name = 'AgentReclaimingError'
+  }
+}
+
+/**
+ * Raised after irreversible reclamation teardown fails. The identity is
+ * quarantined: its old instance and same-id replacement are unsafe to resume
+ * or replace automatically, and an owner must surface the unknown outcome
+ * instead of retrying. The original teardown failure is retained as `cause`.
+ */
+export class AgentReclaimTeardownError extends Error {
+  /** Discriminant for owners distinguishing an unknown teardown from a guard refusal. */
+  readonly kind = 'unknown-teardown' as const
+  /**
+   * @param id - the Agent identity whose teardown outcome is unknown.
+   * @param cause - the collected teardown failure.
+   */
+  constructor(readonly id: SessionId, override readonly cause: unknown) {
+    super(`agent "${id}" teardown outcome is unknown after reclaim; do not resume or replace automatically`, { cause })
+    this.name = 'AgentReclaimTeardownError'
+  }
+}
+
+/** Registry-owned seal token. `abort` restores admission; `commit` is irreversible. */
+export interface AgentReclaimTicket {
+  /** Aborted when the owner must stop waiting for the background check. */
+  readonly signal: AbortSignal
+  /** Restore open admission; a no-op after {@link AgentReclaimTicket.commit} or a second abort. */
+  abort(): void
+  /** Make the seal irreversible; idempotent. */
+  commit(): void
 }
 
 /**
@@ -207,6 +327,22 @@ const NO_FACTORY_MESSAGE = 'no agent factory registered (load an agent-loop plug
 const NO_INITIATOR_MESSAGE = 'no initiating agent is active'
 const DISPOSED_INITIATOR_MESSAGE = 'agent initiator scope is disposed'
 
+/**
+ * Exact-instance admission ledger. The live entry is one referent and a weak
+ * registry map is the other, so a detached instance still rejects work without
+ * retaining retired lifecycles. It holds no long-lived Agent reference; the
+ * in-flight seal is cleared on commit, abort, or detach.
+ */
+interface AgentAdmission {
+  leases: number
+  state: AgentRetentionState
+  lastLeaseReleaseAt: number
+  /** Set when the registry no longer owns this exact lifecycle. */
+  closed: boolean
+  /** Aborts the in-flight seal when the owner tears this lifecycle down. */
+  activeSeal: { abort(): void } | undefined
+}
+
 /** All mutable lifecycle state for one exact registry entry. */
 interface AgentEntry {
   readonly id: SessionId
@@ -217,6 +353,8 @@ interface AgentEntry {
   announced: boolean
   announcing: boolean
   detachRequested: boolean
+  /** Exact-lifecycle admission ledger, shared only with the weak retired-instance lookup. */
+  readonly admission: AgentAdmission
 }
 
 /** One tracked boundary plus its inherited nesting chain. */
@@ -244,6 +382,8 @@ interface FactorySlot {
  */
 export class AgentRegistry extends Service {
   private store = new Map<SessionId, AgentEntry>()
+  /** Weak exact-instance record: detached and same-id-replaced Agents stay rejected without a retired map. */
+  private readonly admissions = new WeakMap<Agent, AgentAdmission>()
   private factory: FactorySlot | undefined
   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
@@ -467,6 +607,13 @@ export class AgentRegistry extends Service {
     // This is the authoritative collision boundary. Concurrent create/resume
     // operations may both prepare, but only one exact entry can publish.
     if (this.store.has(id)) throw new Error(`agent "${id}" is already registered`)
+    const admission: AgentAdmission = {
+      leases: 0,
+      state: 'open',
+      lastLeaseReleaseAt: 0,
+      closed: false,
+      activeSeal: undefined,
+    }
     const entry: AgentEntry = {
       id,
       agent,
@@ -475,8 +622,10 @@ export class AgentRegistry extends Service {
       announced: false,
       announcing: false,
       detachRequested: false,
+      admission,
     }
     this.store.set(id, entry)
+    this.admissions.set(agent, admission)
     let entered = true
     const detach = (): void => {
       if (!entered) return
@@ -503,6 +652,9 @@ export class AgentRegistry extends Service {
     /* v8 ignore next -- enter() rejects replacement while this single-shot detach capability is live. */
     if (this.store.get(entry.id) !== entry) return
     this.store.delete(entry.id)
+    entry.admission.closed = true
+    entry.admission.activeSeal?.abort()
+    entry.admission.activeSeal = undefined
     // An insertion rolled back before announce was never externally created,
     // so emitting disposed would invent an impossible lifecycle edge. Marking
     // happens before the created emit: if a later created listener throws,
@@ -567,6 +719,121 @@ export class AgentRegistry extends Service {
    */
   get(id: SessionId): Agent | undefined {
     return this.store.get(id)?.agent
+  }
+
+  /** Resolve one exact live entry; a same-id replacement never satisfies an old reference. */
+  private exactEntry(agent: Agent): AgentEntry | undefined {
+    const entry = this.store.get(agent.id)
+    return entry?.agent === agent ? entry : undefined
+  }
+
+  /**
+   * Read the exact-Agent retention accounting. Unknown or replaced instances
+   * are not live and therefore report no lifecycle.
+   * @param agent - the exact live Agent instance.
+   * @returns the authoritative lease/state snapshot, or undefined when not live.
+   */
+  retention(agent: Agent): AgentRetention | undefined {
+    const entry = this.exactEntry(agent)
+    if (entry === undefined) return undefined
+    const { leases, lastLeaseReleaseAt, state } = entry.admission
+    return { leases, lastLeaseReleaseAt, state, observedAt: Date.now() }
+  }
+
+  /**
+   * Acquire one synchronous exact-Agent usage lease. The lease pins reclamation
+   * until it is released; sealed or quarantined identities reject before any
+   * caller side effect. Callers that hold no live Agent skip this and skip
+   * reclamation eligibility themselves.
+   * @param agent - the exact live Agent instance to pin.
+   * @returns the idempotent release capability.
+   * @throws {@link AgentReclaimingError} when admission is sealed/quarantined,
+   *   or when `agent` is not the exact registered instance.
+   */
+  retain(agent: Agent): AgentActivityLease {
+    const entry = this.exactEntry(agent)
+    if (entry === undefined) throw new Error(`agent "${agent.id}" is not live in this registry`)
+    if (entry.admission.closed || entry.admission.state !== 'open') throw new AgentReclaimingError(entry.id)
+    entry.admission.leases += 1
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        // A detached lifecycle discards its accounting with the entry.
+        if (this.store.get(entry.id) !== entry) return
+        entry.admission.leases -= 1
+        entry.admission.lastLeaseReleaseAt = Date.now()
+      },
+    }
+  }
+
+  /**
+   * Reject new work reaching a sealed, quarantined, detached, or same-id
+   * replaced exact Agent. An Agent with no admission record was never entered
+   * by this registry, so unpublished setup keeps its legal pre-publication
+   * writes. Detached instances stay rejected through the weak record without a
+   * strong retired-reference map.
+   * @param agent - the Agent whose admission to check.
+   * @throws {@link AgentReclaimingError} when this exact lifecycle does not accept work.
+   */
+  assertAcceptsWork(agent: Agent): void {
+    const admission = this.admissions.get(agent)
+    if (admission === undefined) return
+    if (admission.closed || admission.state !== 'open') throw new AgentReclaimingError(agent.id)
+  }
+
+  /**
+   * Atomically seal admission when the exact entry is open and has no usage
+   * leases. This is synchronous, so it cannot interleave with retain/work
+   * admission inside one event-loop turn.
+   * @param agent - the exact live Agent to seal.
+   * @returns the seal ticket, or undefined when work/lease accounting forbids it.
+   */
+  sealReclaim(agent: Agent): AgentReclaimTicket | undefined {
+    const entry = this.exactEntry(agent)
+    const admission = entry?.admission
+    if (entry === undefined || admission === undefined
+      || admission.closed || admission.state !== 'open' || admission.leases !== 0) return undefined
+    const abort = new AbortController()
+    let settled = false
+    const seal: AgentReclaimTicket = {
+      signal: abort.signal,
+      abort: () => {
+        if (settled) return
+        settled = true
+        abort.abort()
+        if (admission.activeSeal === seal) admission.activeSeal = undefined
+        if (this.store.get(entry.id) === entry && admission.state === 'sealed') {
+          admission.state = 'open'
+        }
+      },
+      commit: () => {
+        if (settled) return
+        settled = true
+        if (admission.activeSeal === seal) admission.activeSeal = undefined
+      },
+    }
+    admission.state = 'sealed'
+    admission.activeSeal = seal
+    return seal
+  }
+
+  /**
+   * Mark one exact Agent quarantined after an unknown teardown outcome, even
+   * when its registry entry is already detached. New work and leases from the
+   * old instance reject; the caller must not automatically resume or replace
+   * the identity. The weak admission record keeps this state without retaining
+   * the Agent.
+   * @param agent - the exact Agent whose teardown outcome is unknown.
+   */
+  quarantine(agent: Agent): void {
+    const admission = this.admissions.get(agent)
+    if (admission === undefined) return
+    admission.state = 'quarantined'
+    admission.closed = true
+    admission.activeSeal?.abort()
+    admission.activeSeal = undefined
   }
 
   /**

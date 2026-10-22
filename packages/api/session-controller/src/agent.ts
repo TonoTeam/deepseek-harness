@@ -4,8 +4,13 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import {
+  AgentReclaimTeardownError,
+  AgentReclaimingError,
+} from '@deepseek-ai/dsh-agent'
 import type {
-  Agent, AgentOptions, AgentSetup, ModelSelection as AgentModelSelection, ModelSelectionRef,
+  Agent, AgentActivityLease, AgentHandle, AgentOptions, AgentSetup, CreateAgentOptions,
+  ModelSelection as AgentModelSelection, ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
@@ -14,7 +19,7 @@ import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionInspection } from '@deepseek-ai/dsh-session-persistence'
 import { SessionQueryError, type SessionObservation } from '@deepseek-ai/dsh-session-query'
-import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError, remoteErrorOf, type TypertBorrowedValue } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-typert-registry'
 import type { ModelSelection } from './types.ts'
 
@@ -81,6 +86,14 @@ export interface ApiSessionCreated {
   readonly agentPreset: string | undefined
 }
 
+/** Published forked Agent plus the creator-held lease for its post-create lifetime. */
+export interface ApiForkedAgent {
+  /** Published child Agent. */
+  readonly agent: Agent
+  /** Release the creator-held usage lease; idempotent, and the tracked handle stays reclaimable afterwards. */
+  readonly release: () => void
+}
+
 /** Resolved preset and pre-publication Agent setup for one create or resume. */
 interface ApiSessionComposition {
   readonly agentPreset?: string
@@ -94,6 +107,32 @@ export type ApiSessionAgentError = RemoteError<'session/not-found' | 'session/ag
 export type ApiSessionAgentResult =
   | { readonly agent: Agent }
   | { readonly error: ApiSessionAgentError }
+
+/**
+ * Opt-in idle reclamation policy for creator-owned ordinary API Agents.
+ * Upstream stays disabled; a deployment enables it with explicit bounds.
+ */
+export interface ApiIdleEvictionConfig {
+  /** Whether the bounded sweep runs at all; disabled by default. */
+  readonly enabled: boolean
+  /** Real quiescence time before an idle Agent becomes a reclaim candidate. */
+  readonly idleTtlMs: number
+  /** Delay between bounded, non-overlapping sweeps. */
+  readonly sweepPeriodMs: number
+  /** Maximum candidates examined by one sweep. */
+  readonly maxPerSweep: number
+  /** Maximum time the read-only activity proof may keep admission sealed. */
+  readonly reclaimTimeoutMs: number
+}
+
+/** Default idle policy bounds: ten minutes idle, one-minute sweeps, eight candidates. */
+export const DEFAULT_API_IDLE_EVICTION: ApiIdleEvictionConfig = Object.freeze({
+  enabled: false,
+  idleTtlMs: 600_000,
+  sweepPeriodMs: 60_000,
+  maxPerSweep: 8,
+  reclaimTimeoutMs: 5_000,
+})
 
 type InstalledSelection = ModelSelectionRef & {
   current: AgentModelSelection
@@ -172,24 +211,46 @@ export class ApiSessionAgentController {
   private readonly claims = new Map<SessionId, Promise<void>>()
   private readonly selections = new WeakMap<Agent, InstalledSelection>()
   private readonly imageAdmissionChains = new WeakMap<Agent, Promise<void>>()
+  /** Full creator-owned handles, never only their Agent, so reclamation keeps the capability. */
+  private readonly handles = new Map<SessionId, AgentHandle>()
+  /** Identities currently sealed for reclamation; new acquisitions wait here. */
+  private readonly retiring = new Map<SessionId, Promise<void>>()
+  /** Unknown teardown outcomes block automatic resume/replacement until an operator acts. */
+  private readonly quarantined = new Map<SessionId, AgentReclaimTeardownError>()
+  private policy: ApiIdleEvictionConfig | undefined
+  private idleTimer: ReturnType<typeof setTimeout> | undefined
+  private sweeping = false
+  private disposed = false
+  /** Rotating start position so blocked candidates cannot starve later ones. */
+  private sweepCursor = 0
+  /** Owner shutdown signal handed to every in-flight reclamation check. */
+  private readonly shutdown = new AbortController()
 
-  /** @param ctx - Host context carrying Agent, model, persistence, and Typert services. */
-  constructor(private readonly ctx: Context) {
+  /**
+   * @param ctx - Host context carrying Agent, model, persistence, and Typert services.
+   * @param idleEviction - opt-in idle policy; omitted keeps reclamation disabled.
+   */
+  constructor(private readonly ctx: Context, idleEviction?: ApiIdleEvictionConfig) {
     ctx.typert.lookups.configure('agent', async (sessionId: SessionId) => {
       const found = await this.resolveAgent(sessionId)
       if ('error' in found) throw found.error
       return found.agent
-    })
+    }, this.borrower(agent => agent))
     ctx.typert.lookups.configure('session', async (sessionId: SessionId) => {
       const found = await this.resolveAgent(sessionId)
       if ('error' in found) throw found.error
       return found.agent.session
-    })
+    }, this.borrower(agent => agent.session))
     ctx.typert.contexts.configureHost('agent', async (sessionId: SessionId) => {
       const found = await this.resolveAgent(sessionId)
       if ('error' in found) throw found.error
       return found.agent.ctx
+    }, this.borrower(agent => agent.ctx))
+    ctx.on('agent/disposed', ({ agent }) => {
+      if (this.handles.get(agent.id)?.agent === agent) this.handles.delete(agent.id)
     })
+    if (idleEviction !== undefined) this.startIdleEviction(idleEviction)
+    ctx.effect(() => () => { this.disposeIdleEviction() }, 'session-controller.idle-eviction')
   }
 
   /**
@@ -214,6 +275,10 @@ export class ApiSessionAgentController {
     sessionId: SessionId,
     observation?: SessionObservation,
   ): Promise<ApiSessionAgentResult> {
+    const quarantine = this.quarantined.get(sessionId)
+    if (quarantine !== undefined) return { error: this.quarantineError(sessionId) }
+    await this.waitRetiring(sessionId)
+    if (this.quarantined.has(sessionId)) return { error: this.quarantineError(sessionId) }
     const live = this.liveAgent(sessionId)
     if (live !== undefined) return live
     const attached = this.ctx.sessions.get(sessionId)
@@ -278,6 +343,7 @@ export class ApiSessionAgentController {
   async createSession(request: ApiSessionCreateRequest): Promise<ApiSessionCreated> {
     const named = request.sessionId
     if (named === undefined) return this.created(await this.createMinted(request.cwd, await this.composeAgent(request.agentPreset)))
+    this.assertNotQuarantined(named)
     return this.inOrder(named, async () => this.created(await this.claim(named, request)))
   }
 
@@ -437,11 +503,13 @@ export class ApiSessionAgentController {
     if (published !== undefined && hasApiSessionSubagentOwner(this.ctx, published, live)) {
       throw new ApiSessionSubagentOwnership(sessionId)
     }
-    return (await this.ctx.agents.resume({
+    const handle = await this.ctx.agents.resume({
       resumeSessionId: sessionId,
       agentOptions: this.agentOptions(),
       setup: composition.setup,
-    })).agent
+    })
+    this.track(handle)
+    return handle.agent
   }
 
   private async inOrder<Value>(sessionId: SessionId, operation: () => Promise<Value>): Promise<Value> {
@@ -457,6 +525,9 @@ export class ApiSessionAgentController {
 
   /** @returns the reused Session, a new Session under `sessionId` when none is stored, or a new Session under a minted identity. */
   private async claim(sessionId: SessionId, request: ApiSessionCreateRequest): Promise<Agent> {
+    this.assertNotQuarantined(sessionId)
+    await this.waitRetiring(sessionId)
+    this.assertNotQuarantined(sessionId)
     const attached = this.ctx.sessions.get(sessionId)
     const live = this.ctx.agents.get(sessionId)
     if (attached !== undefined && hasApiSessionSubagentOwner(this.ctx, attached, live)) {
@@ -491,11 +562,13 @@ export class ApiSessionAgentController {
     if (!reusable) return this.createMinted(request.cwd, composition)
     this.assertPresetApplicable(sessionId, request.agentPreset)
     try {
-      return (await this.ctx.agents.resume({
+      const handle = await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
         setup: this.reuseSetup(composition),
-      })).agent
+      })
+      this.track(handle)
+      return handle.agent
     } catch (error: unknown) {
       if (error instanceof ApiSessionStartedSinceObserved) return this.createMinted(request.cwd, composition)
       if (!(error instanceof Error) || error.name !== 'SessionAlreadyOwnedError') throw error
@@ -546,6 +619,20 @@ export class ApiSessionAgentController {
     return boundary === undefined || (boundary.openTurnStartSeq === null && boundary.lastTurn === 0)
   }
 
+  /**
+   * Whether the Session has at least one closed turn whose latest step also
+   * closed. A blank Session, an open turn, or a step still in progress has no
+   * complete persisted turn to recover, so reclamation defers.
+   */
+  private hasCompletedTurn(session: Session): boolean {
+    if (this.isBlank(session)) return false
+    const boundary = this.ctx.sessionProjections.stateOf(session, 'turnBoundary')
+    return boundary !== undefined
+      && boundary.openTurnStartSeq === null
+      && boundary.lastTurn > 0
+      && boundary.lastStepBoundary?.kind === 'end'
+  }
+
   /** Without a roster, reuse cannot apply a named preset. */
   private assertPresetApplicable(sessionId: SessionId, requested: string | undefined): void {
     if (requested === undefined || this.ctx.get('agentPresets') !== undefined) return
@@ -560,13 +647,32 @@ export class ApiSessionAgentController {
     return this.createAgent(brandString<SessionId>(`session-${randomUUID()}`), cwd, composition)
   }
 
+  /**
+   * Create one forked child and retain its full creator-owned handle.
+   * Fork composes its seeded child directly instead of using the ordinary
+   * create/resume claim path; this method adds the returned handle to the same
+   * idle policy without a second create or resume. The exact child keeps one
+   * creator usage lease from publication through the caller's post-create
+   * work, so quiescence cannot reclaim it while that work is pending.
+   * @param options - complete seeded creation options for the child.
+   * @returns the published forked Agent and its creator-held lease.
+   */
+  async createForkedAgent(options: CreateAgentOptions): Promise<ApiForkedAgent> {
+    const handle = await this.ctx.agents.create(options)
+    this.track(handle)
+    // Acquire immediately after publication; a failure here keeps the handle
+    // tracked so a later sweep can reclaim it.
+    const lease = this.ctx.agents.retain(handle.agent)
+    return { agent: handle.agent, release: () => { lease.release() } }
+  }
+
   private async createAgent(sessionId: SessionId, cwd: string, composition: ApiSessionComposition): Promise<Agent> {
     try {
       await mkdir(cwd, { recursive: true })
     } catch (error: unknown) {
       throw new Error(`failed to ensure project directory "${cwd}": ${String(error)}`, { cause: error })
     }
-    return (await this.ctx.agents.create({
+    const handle = await this.ctx.agents.create({
       sessionId,
       agentOptions: this.agentOptions(),
       meta: {
@@ -574,7 +680,9 @@ export class ApiSessionAgentController {
         ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
       },
       setup: composition.setup,
-    })).agent
+    })
+    this.track(handle)
+    return handle.agent
   }
 
   private agentOptions(): AgentOptions {
@@ -584,6 +692,207 @@ export class ApiSessionAgentController {
 
   private installSelection(agent: Agent): void {
     this.selectionFor(agent)
+  }
+
+  private track(handle: AgentHandle): void {
+    this.handles.set(handle.agent.id, handle)
+  }
+
+  private quarantineError(sessionId: SessionId): ApiSessionAgentError {
+    return new RemoteError(
+      'gateway/internal',
+      `session "${sessionId}" is quarantined after an unknown reclamation teardown; operator action is required`,
+      { sessionId, reason: 'unknown-teardown' },
+    )
+  }
+
+  private assertNotQuarantined(sessionId: SessionId): void {
+    if (this.quarantined.has(sessionId)) throw this.quarantineError(sessionId)
+  }
+
+  private async waitRetiring(sessionId: SessionId): Promise<void> {
+    for (;;) {
+      const retiring = this.retiring.get(sessionId)
+      if (retiring === undefined) return
+      await retiring.catch(() => undefined)
+    }
+  }
+
+  private borrower<Value>(read: (agent: Agent) => Value) {
+    return async (sessionId: SessionId): Promise<TypertBorrowedValue<Value>> => {
+      const acquired = await this.acquireRetained(sessionId)
+      return {
+        value: read(acquired.agent),
+        release: () => { acquired.lease.release() },
+      }
+    }
+  }
+
+  /**
+   * Resolve one ordinary Session and acquire its exact usage lease. A seal
+   * race only retries this acquisition; the caller has run no side effect yet.
+   * @param sessionId - ordinary Session identity.
+   * @returns the exact Agent and its idempotent lease.
+   */
+  async acquireRetained(sessionId: SessionId): Promise<{ readonly agent: Agent; readonly lease: AgentActivityLease }> {
+    for (;;) {
+      await this.waitRetiring(sessionId)
+      const found = await this.resolveAgent(sessionId)
+      if ('error' in found) throw found.error
+      try {
+        return { agent: found.agent, lease: this.ctx.agents.retain(found.agent) }
+      } catch (error: unknown) {
+        if (!(error instanceof AgentReclaimingError)) throw error
+        await this.waitRetiring(sessionId)
+      }
+    }
+  }
+
+  /**
+   * Run one internal asynchronous operation under an exact usage lease.
+   * @param sessionId - ordinary Session identity.
+   * @param operation - work that must finish before the Agent can be reclaimed.
+   * @returns the operation result.
+   */
+  async withRetainedAgent<Value>(
+    sessionId: SessionId,
+    operation: (agent: Agent) => Promise<Value>,
+  ): Promise<Value> {
+    const acquired = await this.acquireRetained(sessionId)
+    try {
+      return await operation(acquired.agent)
+    } finally {
+      acquired.lease.release()
+    }
+  }
+
+  /**
+   * Pin an already live Agent for an external lifetime such as an active
+   * follow stream. Cold Sessions acquire nothing; creation/resume publication
+   * already withholds idle eligibility until it settles.
+   * @param sessionId - Session whose live Agent must stay resident.
+   * @returns the lease, or undefined when no Agent is live or it is sealing.
+   */
+  retainLive(sessionId: SessionId): AgentActivityLease | undefined {
+    const agent = this.ctx.agents.get(sessionId)
+    if (agent === undefined) return undefined
+    try {
+      return this.ctx.agents.retain(agent)
+    } catch (error: unknown) {
+      if (error instanceof AgentReclaimingError) return undefined
+      throw error
+    }
+  }
+
+  /**
+   * Start the bounded idle sweep. It starts from real quiescence
+   * (`AgentHandle.reclaim.idleSince`) and never overlaps a running sweep.
+   * @param policy - enabled policy and positive bounds.
+   */
+  startIdleEviction(policy: ApiIdleEvictionConfig): void {
+    this.policy = policy
+    if (!policy.enabled || this.disposed) return
+    const schedule = (): void => {
+      if (this.disposed) return
+      this.idleTimer = setTimeout(() => {
+        void this.sweepIdleAgents().finally(schedule)
+      }, policy.sweepPeriodMs)
+      this.idleTimer.unref()
+    }
+    schedule()
+  }
+
+  /**
+   * Run one bounded, non-overlapping reclamation sweep. Each eligible
+   * creator-owned handle is checked under its own atomic seal; workspace
+   * activity, including schedules, is asked read-only inside that check.
+   * @returns after the candidate bound or exhaustion.
+   */
+  async sweepIdleAgents(): Promise<void> {
+    const policy = this.policy
+    if (policy === undefined || !policy.enabled || this.sweeping || this.disposed) return
+    this.sweeping = true
+    try {
+      const now = Date.now()
+      let examined = 0
+      const entries = [...this.handles]
+      const total = entries.length
+      if (total === 0) return
+      // Start after the last attempted candidate and wrap once. A candidate
+      // whose check keeps reporting activity must not consume the same prefix
+      // of the map on every sweep.
+      let index = this.sweepCursor % total
+      for (let visited = 0; visited < total && !this.shutdown.signal.aborted && examined < policy.maxPerSweep; visited += 1) {
+        const entry = entries[index]
+        index = (index + 1) % total
+        if (entry === undefined) continue
+        const [sessionId, handle] = entry
+        if (this.handles.get(sessionId) !== handle) continue
+        const reclaim = handle.reclaim
+        if (reclaim === undefined) continue
+        if (!this.hasCompletedTurn(handle.agent.session)) continue
+        const idleSince = reclaim.idleSince()
+        if (idleSince === undefined || now - idleSince < policy.idleTtlMs) continue
+        this.sweepCursor = index
+        examined += 1
+        await this.reclaimIdle(sessionId, handle, reclaim)
+      }
+    } finally {
+      this.sweeping = false
+    }
+  }
+
+  private async reclaimIdle(
+    sessionId: SessionId,
+    handle: AgentHandle,
+    reclaim: NonNullable<AgentHandle['reclaim']>,
+  ): Promise<void> {
+    let settle!: () => void
+    const retiring = new Promise<void>((resolve) => { settle = resolve })
+    this.retiring.set(sessionId, retiring)
+    try {
+      const outcome = await reclaim.tryReclaim(async (signal) => {
+        signal.throwIfAborted()
+        if (!this.hasCompletedTurn(handle.agent.session)) return false
+        const activity = await this.ctx.waterfall(
+          'workspace/session-activity', { sessionId }, () => Promise.resolve([]),
+        )
+        signal.throwIfAborted()
+        return activity.length === 0
+      }, {
+        signal: this.shutdown.signal,
+        timeoutMs: this.policy?.reclaimTimeoutMs ?? DEFAULT_API_IDLE_EVICTION.reclaimTimeoutMs,
+      })
+      if (outcome.kind === 'reclaimed') {
+        if (this.handles.get(sessionId) === handle) this.handles.delete(sessionId)
+        this.ctx.logger.info(`session-controller: reclaimed idle Session "${sessionId}"`)
+      }
+    } catch (error: unknown) {
+      if (error instanceof AgentReclaimTeardownError) {
+        this.quarantined.set(sessionId, error)
+        this.ctx.logger.error(`session-controller: quarantine after unknown teardown for "${sessionId}": ${error.message}`)
+      } else {
+        this.ctx.logger.warn(`session-controller: idle reclamation skipped for "${sessionId}": ${String(error)}`)
+      }
+    } finally {
+      settle()
+      if (this.retiring.get(sessionId) === retiring) this.retiring.delete(sessionId)
+    }
+  }
+
+  /** Stop the sweep timer, abort in-flight checks, and drop every policy record at owner shutdown. */
+  disposeIdleEviction(): void {
+    this.disposed = true
+    this.policy = undefined
+    if (this.idleTimer !== undefined) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+    }
+    this.shutdown.abort()
+    this.handles.clear()
+    this.retiring.clear()
+    this.quarantined.clear()
+    this.sweepCursor = 0
   }
 
   /**

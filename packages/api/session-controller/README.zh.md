@@ -62,7 +62,7 @@ Session 对象还承载本地提交回显：`session.beginSubmission` 在调用�
 
 面向用户调用的 `skills/list` 元数据包含胜出提供方可选的指令文件 `path`。输入框可据此预览文件，无需加载每个 skill 的正文或激活冷态 Agent。
 
-Fork 复制 `atSeq` 所选的精确事件前缀，包含切点事件，允许在开放轮次内截取。子会话在合成的 fork 结果和结束事件之前记录继承标记。省略 `atSeq` 时选择最近已结束轮次及其独立尾部，在下一轮次或排队输入之前停止；不存在的事件会被拒绝。聊天操作选择已结束轮次。
+Fork 复制 `atSeq` 所选的精确事件前缀，包含切点事件，允许在开放轮次内截取。子会话在合成的 fork 结果和结束事件之前记录继承标记。省略 `atSeq` 时选择最近已结束轮次及其独立尾部，在下一轮次或排队输入之前停止；不存在的事件会被拒绝。聊天操作选择已结束轮次。Fork 创建的子会话是创建者所拥有的普通 Agent：其完整 handle 纳入同一空闲回收策略，因此空闲的 fork 会被回收，并在之后从其持久前缀冷恢复。创建者租约从子 Agent 发布起覆盖创建后的工作区挂载，并在成功或失败时释放；已登记的 handle 在两种情况下都可被回收。
 
 恢复会话时若已有写句柄占用，返回 `session/writer-held`，并携带会话 id；其他恢复失败仍返回 `gateway/internal`。
 
@@ -101,6 +101,13 @@ GUI 模型选择要求确切提供方／模型对出现在可用目录中；不�
 |---|---:|---|
 | `nativeOpen` | 平台探测 | 是否能把 Session 工作区路径交给原生桌面打开器 |
 | `listWorkSliceMs` | `16` | 列表工作时间片，单位为毫秒，取正整数；在完整条目之间检查 |
+| `idleEviction.enabled` | `false` | 是否启用对创建者所拥有普通 API Agent 的有界回收 |
+| `idleEviction.idleTtlMs` | `600000` | Agent 成为回收候选前所需的真实静默时长 |
+| `idleEviction.sweepPeriodMs` | `60000` | 有界且不重叠的扫描间隔 |
+| `idleEviction.maxPerSweep` | `8` | 单次扫描最多检查的候选数 |
+| `idleEviction.reclaimTimeoutMs` | `5000` | 只读活动证明最多可保持封存状态的时长 |
+
+`idleEviction.enabled` 为 true 时，控制器保留每个创建者所拥有普通 Agent 的完整 `AgentHandle`，并且只在 `AgentHandle.reclaim.idleSince()` 报告的真实静默超过 `idleTtlMs` 后定期回收。每次扫描都从上一次尝试过的候选之后开始并环绕一次，因此长期被阻塞的候选无法饿死后面的候选。原子检查在封存内询问既有只读 `workspace/session-activity` waterfall；任何报告的活动、错误或未知类别都会跳过该候选，且不 archive、停止、取消或 kill 工作。guard 或 flush 失败会恢复同一个 Agent。空 Session，或尚无完整闭合回合的 Session，因为没有持久恢复点而不会被回收。`AgentReclaimTeardownError` 会使该 Session id 进入隔离：后续 resolve 与具名 create 请求失败，而不是自动替换身份，必须由操作员处理。成功回收会丢弃 handle 与全部策略元数据；停机清理 timer 与记录，并中止仍在进行活动检查。遇到封存或已回收实例的待处理请求会等待，然后只重试 Agent 获取；prompt、upload 与 command 等副作用绝不重放。活跃 follow 会在 follower generator 清理完成前固定住 live Agent，冷 follow 在激活发布其 Agent 后也同样固定。HTTP 上传路径绕过 Gateway，因此 file-upload 服务通过可选 borrower 为真实存储流取得 exact-Agent 租约；每个暂存凭证随后固定其 owner，直到 prompt 准入消费它，或队列/历史观察使其退休。
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-api-session-controller)是所有受支持字段及其 JSDoc 的完整来源。
 

@@ -15,7 +15,7 @@ import type {
 
 export { RemoteError, remoteErrorOf } from './remote-error.ts'
 export { TYPERT_OWNED_VALUE, isTypertOwnedValue, typertOwnedValue } from './owned-value.ts'
-export type { TypertOwnedValue } from './owned-value.ts'
+export type { TypertBorrowedValue, TypertBorrower, TypertOwnedValue } from './owned-value.ts'
 export { isRemoteJsonValue, isRemoteUplinkItem } from './json-value.ts'
 export { createTypertRemoteInfo, isTypertRemoteMethod } from './remote-info.ts'
 export { principalOf } from './principal.ts'

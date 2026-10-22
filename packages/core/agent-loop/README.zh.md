@@ -60,6 +60,8 @@ kind: "package-reference"
 
 插件与宿主通过 `ctx.agents.create()` 创建 agent，通过 `ctx.agents.resume()` 恢复持久化会话；两者都返回 `AgentHandle`，其 `dispose()`（资源释放）负责精确拆除对应的 agent。循环会把每个创建的 agent 运行到完成——只有调用方需要自行拆除 agent 时才需要句柄。
 
+原生循环的句柄还暴露可选的 `reclaim` 拥有者能力。`idleSince()` 从最近的 idle 阶段、inbox 变更或使用租约释放起报告真实静止，并在运行轮次、维护、待处理 inbox 输入与尚未完成的发布期间不报告。`tryReclaim(check, { signal, timeoutMs })` 同步封口准入，在封口下运行调用方有界的后台活动检查，要求一次真实参与的持久化 flush，然后才调用常规拆除；`signal`/`timeoutMs` 让拥有者约束挂起的检查或 flush，而不会让准入永久封口。检查被拒、flush 失败或与拆除竞态都会中止封口并保留同一个实时 Agent，而封口期间新的 `send`/`inject`/inbox splice 输入会以 `AgentReclaimingError` 拒绝。未知的拆除结果会隔离身份并抛出 `AgentReclaimTeardownError`，供拥有者上报且不得自动恢复或替换。除非部署策略显式启用，没有调用方会使用该能力。
+
 ```text
 const handle = await ctx.agents.create({
   sessionId,

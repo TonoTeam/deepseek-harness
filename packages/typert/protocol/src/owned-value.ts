@@ -37,3 +37,20 @@ export function isTypertOwnedValue(value: unknown): value is TypertOwnedValue<un
   return typeof value === 'object' && value !== null
     && TYPERT_OWNED_VALUE in value && value[TYPERT_OWNED_VALUE] === true
 }
+
+/** A Host value borrowed for one invocation, with synchronous idempotent cleanup. */
+export interface TypertBorrowedValue<Value> {
+  readonly value: Value
+  /** Release the underlying usage claim; synchronous, idempotent, and non-throwing. */
+  release(): void
+}
+
+/**
+ * Host-only optional acquisition used instead of plain resolution when a
+ * provider can hold the exact object for the invocation lifetime.
+ * @param id - validated wire identity.
+ * @returns the borrowed value and its release capability.
+ */
+export type TypertBorrower<Value, Wire> = (
+  id: Wire,
+) => TypertBorrowedValue<Value> | Promise<TypertBorrowedValue<Value>>

@@ -60,6 +60,8 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 Plugins and hosts create agents through `ctx.agents.create()` and resume persisted sessions through `ctx.agents.resume()`; both return an `AgentHandle` whose `dispose()` owns exact teardown. The loop runs each created agent to completion — the handle is only needed when the caller must tear the agent down itself.
 
+The native loop's handle also exposes the optional `reclaim` owner capability. `idleSince()` reports true quiescence from the latest idle phase, inbox mutation, or usage-lease release, and withholds it during running turns, maintenance, pending inbox input, and unsettled publication. `tryReclaim(check, { signal, timeoutMs })` synchronously seals admission, runs the caller's bounded background-activity check under the seal, requires a participating durable flush, and only then invokes the ordinary teardown; `signal`/`timeoutMs` let an owner bound a hung check or flush without keeping admission sealed. A refused check, failed flush, or teardown race aborts the seal and keeps the same live Agent, while new `send`/`inject`/inbox-splice input during the seal rejects with `AgentReclaimingError`. An unknown teardown outcome quarantines the identity and throws `AgentReclaimTeardownError` for the owner to surface without automatic resume or replacement. No caller invokes this capability unless deployment policy opts in.
+
 ```text
 const handle = await ctx.agents.create({
   sessionId,

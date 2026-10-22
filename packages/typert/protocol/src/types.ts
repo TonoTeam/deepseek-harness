@@ -7,7 +7,7 @@
 import type { Context, Events } from '@deepseek-ai/cordis'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { ZodType } from 'zod'
-import type { TypertOwnedValue } from './owned-value.ts'
+import type { TypertBorrowedValue, TypertBorrower, TypertOwnedValue } from './owned-value.ts'
 
 declare const LOOKUP_HOST: unique symbol
 declare const LOOKUP_WIRE: unique symbol
@@ -668,6 +668,15 @@ export interface TypertLookupProvider<Host = unknown, Wire = unknown> {
    * @returns the object, `undefined` when unavailable, or either asynchronously.
    */
   resolve(id: Wire): Host | undefined | Promise<Host | undefined>
+  /**
+   * Host-only acquisition alternative to {@link TypertLookupProvider.resolve}.
+   * When present the Gateway borrows through this method so the provider can
+   * pin the exact object for the invocation lifetime; absent means the plain
+   * resolver remains the composition's only policy.
+   * @param id - validated wire identity.
+   * @returns the pinned Host object and its synchronous release capability.
+   */
+  borrow?(id: Wire): TypertBorrowedValue<Host> | Promise<TypertBorrowedValue<Host>>
 }
 
 /** Stable wire declaration retained after a lookup provider unloads. */
@@ -698,6 +707,14 @@ export interface TypertHostContextAdapter<Wire = unknown> {
    * @returns the Context, or `undefined` when it is unavailable.
    */
   resolve(id: Wire): Context | undefined | Promise<Context | undefined>
+  /**
+   * Host-only acquisition alternative to {@link TypertHostContextAdapter.resolve}.
+   * The Gateway prefers it so the Context owner can pin the exact instance for
+   * the invocation lifetime; absent means plain resolution stays in effect.
+   * @param id - validated wire identity.
+   * @returns the pinned Context and its synchronous release capability.
+   */
+  borrow?(id: Wire): TypertBorrowedValue<Context> | Promise<TypertBorrowedValue<Context>>
 }
 
 /** Composition-owned resolver replacing one Host Context adapter's default lookup policy. */
@@ -798,11 +815,16 @@ export interface TypertLookupRegistry {
    * Configuration may precede provider registration; without a live provider, `get()` remains unavailable.
    * @param key - lookup key whose wire declaration remains provider-owned.
    * @param resolver - composition-owned resolver used by every lookup of this key.
-   * @returns disposer restoring the provider's default resolver.
+   * @param borrow - optional composition-owned acquisition preferred over the resolver.
+   * @returns disposer restoring the provider's default resolution policy.
    */
   configure<K extends StringKeyOf<TypertLookupMap>>(
     key: K,
     resolver: TypertLookupResolver<
+      TypertLookupHost<TypertLookupMap[K]>,
+      TypertLookupWire<TypertLookupMap[K]>
+    >,
+    borrow?: TypertBorrower<
       TypertLookupHost<TypertLookupMap[K]>,
       TypertLookupWire<TypertLookupMap[K]>
     >,
@@ -842,11 +864,13 @@ export interface TypertContextRegistry {
    * Configuration may precede provider registration and restores the provider's default resolver on disposal.
    * @param key - merge-declared Context key.
    * @param resolver - composition-owned resolver used by every Host Context lookup of this key.
-   * @returns disposer restoring the provider's default resolver.
+   * @param borrow - optional composition-owned acquisition preferred over the resolver.
+   * @returns disposer restoring the provider's default resolution policy.
    */
   configureHost<K extends StringKeyOf<TypertContextMap>>(
     key: K,
     resolver: TypertHostContextResolver<TypertContextWire<TypertContextMap[K]>>,
+    borrow?: TypertBorrower<Context, TypertContextWire<TypertContextMap[K]>>,
   ): TypertDisposer
   /**
    * Register a Client Context adapter.

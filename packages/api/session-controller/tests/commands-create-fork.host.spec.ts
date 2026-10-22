@@ -264,6 +264,9 @@ describe('Session fork failures', () => {
     const create = vi.spyOn(ctx.agents, 'create').mockImplementation(
       (options: CreateAgentOptions) => Promise.resolve(resolvedHandle(ctx, options.sessionId)),
     )
+    // The stubbed create publishes an Agent outside the registry, so the exact
+    // creator lease is stubbed alongside it.
+    vi.spyOn(ctx.agents, 'retain').mockReturnValue({ release: () => {} })
     const controller = new SessionCommandController(ctx, controllerAgents(ctx), '/default')
 
     await expectFailure(controller.fork({ sessionId: source.id }), 'session/workspace-attach-failed')
@@ -281,6 +284,9 @@ describe('Session fork failures', () => {
     const create = vi.spyOn(ctx.agents, 'create').mockImplementation(
       (options: CreateAgentOptions) => Promise.resolve(resolvedHandle(ctx, options.sessionId)),
     )
+    // The stubbed create publishes an Agent outside the registry, so the exact
+    // creator lease is stubbed alongside it.
+    vi.spyOn(ctx.agents, 'retain').mockReturnValue({ release: () => {} })
     const controller = new SessionCommandController(ctx, controllerAgents(ctx, {
       composeAgent: () => Promise.resolve({ agentPreset: 'minimal', setup: () => {} }),
     }), '/default')
