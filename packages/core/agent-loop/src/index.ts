@@ -653,9 +653,11 @@ export class AgentLoop extends Service implements AgentFactory {
           const ticket = loopCtx.agents.sealReclaim(agent)
           if (ticket === undefined) return { kind: 'busy', reason: 'leases' }
           // Every bound converges on one halt: owner abort, seal abort, or
-          // timeout. A hung proof can therefore never hold admission sealed.
+          // timeout. A hung proof or flush can therefore never hold admission
+          // sealed, and a result arriving after the halt must not commit.
           const halt = new AbortController()
           const unlink: Array<() => void> = []
+          let timer: ReturnType<typeof setTimeout> | undefined
           const isHalted = (): boolean => halt.signal.aborted
           const follow = (signal: AbortSignal | undefined): void => {
             if (signal === undefined) return
@@ -667,52 +669,58 @@ export class AgentLoop extends Service implements AgentFactory {
             signal.addEventListener('abort', onAbort, { once: true })
             unlink.push(() => { signal.removeEventListener('abort', onAbort) })
           }
-          follow(ticket.signal)
-          follow(options?.signal)
-          const timer = options?.timeoutMs === undefined
-            ? undefined
-            : setTimeout(() => { halt.abort() }, options.timeoutMs)
-          if (isHalted()) {
-            ticket.abort()
-            return { kind: 'busy', reason: 'background' }
-          }
-          const halted = new Promise<false>((resolve) => {
-            if (isHalted()) {
-              resolve(false)
-              return
-            }
-            halt.signal.addEventListener('abort', () => { resolve(false) }, { once: true })
+          // Nothing can abort `halt` before this listener is attached, so the
+          // race promise always settles through the signal.
+          const HALTED = Symbol('halted')
+          const halted = new Promise<typeof HALTED>((resolve) => {
+            halt.signal.addEventListener('abort', () => { resolve(HALTED) }, { once: true })
           })
+          // A raced promise that loses may still settle later; observe it so
+          // the late rejection never surfaces as an unhandled rejection.
+          const raceHalt = <T>(work: Promise<T>): Promise<T | typeof HALTED> => {
+            void work.catch(() => {})
+            return Promise.race([work, halted])
+          }
+          const liveReason = (): 'active' | 'background' =>
+            loopCtx.agents.retention(agent) === undefined ? 'active' : 'background'
+          // Everything reversible stays inside this try so every early return
+          // clears the timeout and unlinks the abort listeners.
           try {
-            const proof = Promise.resolve().then(() => check(ticket.signal))
-            // A proof that loses the race may still reject; observe it without
-            // letting that late rejection escape as unhandled.
-            void proof.catch(() => {})
-            if (!(await Promise.race([proof, halted]))) {
+            follow(ticket.signal)
+            follow(options?.signal)
+            if (options?.timeoutMs !== undefined) {
+              timer = setTimeout(() => { halt.abort() }, options.timeoutMs)
+            }
+            if (isHalted()) {
               ticket.abort()
-              return {
-                kind: 'busy',
-                reason: loopCtx.agents.retention(agent) === undefined ? 'active' : 'background',
-              }
+              return { kind: 'busy', reason: 'background' }
+            }
+            const proof = await raceHalt(Promise.resolve().then(() => check(ticket.signal)))
+            if (proof !== true) {
+              ticket.abort()
+              return { kind: 'busy', reason: liveReason() }
             }
             if (loopCtx.agents.retention(agent) === undefined) {
               // Owner teardown raced the proof and already removed this lifecycle.
               ticket.abort()
               return { kind: 'busy', reason: 'active' }
             }
+            const flushed = await raceHalt(loopCtx.sessions.flush(session))
+            if (flushed === HALTED) {
+              // A late flush settles without committing this seal.
+              ticket.abort()
+              return { kind: 'busy', reason: liveReason() }
+            }
             // A false result means no durability listener participated: a
             // memory-only session has no recoverable point, so keep the Agent.
-            if (!(await loopCtx.sessions.flush(session))) {
+            if (!flushed) {
               ticket.abort()
               return { kind: 'busy', reason: 'persistence' }
             }
             // The owner may have backed out while the flush was in flight.
             if (isHalted()) {
               ticket.abort()
-              return {
-                kind: 'busy',
-                reason: loopCtx.agents.retention(agent) === undefined ? 'active' : 'background',
-              }
+              return { kind: 'busy', reason: liveReason() }
             }
             ticket.commit()
           } catch (error: unknown) {

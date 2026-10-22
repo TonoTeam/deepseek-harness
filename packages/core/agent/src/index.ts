@@ -215,9 +215,9 @@ export interface AgentReclaimCapability {
    * check and a participating durable flush proceed to irreversible teardown.
    * The check receives the seal signal, which aborts when the owner tears the
    * lifecycle down or the caller-supplied {@link AgentReclaimOptions.signal}
-   * or timeout fires, so a hung check cannot hold admission sealed forever.
+   * or timeout fires, so a hung proof or flush cannot hold admission sealed forever.
    * @param check - background-activity proof awaited while admission is sealed.
-   * @param options - optional owner abort and timeout bounds for `check`.
+   * @param options - optional owner abort and timeout bounds for the proof and durable flush.
    * @returns the discriminated outcome; `busy` never tears the Agent down.
    */
   tryReclaim(
@@ -230,7 +230,7 @@ export interface AgentReclaimCapability {
 export interface AgentReclaimOptions {
   /** Owner cancellation; aborting restores the same live Agent's admission. */
   readonly signal?: AbortSignal
-  /** Maximum time to await `check`; expiry restores admission with a `background` refusal. */
+  /** Maximum time to await the proof and durable flush; expiry restores admission with a `background` refusal. */
   readonly timeoutMs?: number
 }
 

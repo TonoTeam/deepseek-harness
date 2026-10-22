@@ -170,7 +170,7 @@ describe('owner idle reclamation', () => {
     const maintenance = handle.agent.runMaintenance(async () => { await gate.promise })
     expect(reclaim.idleSince()).toBeUndefined()
     await expect(reclaim.tryReclaim(async () => true)).resolves.toEqual({ kind: 'busy', reason: 'active' })
-    gate.resolve()
+    gate.resolve(undefined)
     await maintenance
     expect(reclaim.idleSince()).toBeTypeOf('number')
 
@@ -237,5 +237,86 @@ describe('owner idle reclamation', () => {
     expect(ctx.agents.get(handle.agent.id)).toBeUndefined()
     expect(() => { handle.agent.inject(message('after teardown')) }).toThrow(AgentReclaimingError)
     stuck.resolve(true)
+  })
+
+  it('bounds a hung flush and keeps the Agent when the flush settles late', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    onTestFinished(() => { process.off('unhandledRejection', onUnhandled) })
+
+    for (const failLate of [false, true]) {
+      const ctx = await harness({ persistent: true })
+      const sessionId = SessionId(`reclaim-flush-late-${failLate ? 'failure' : 'success'}`)
+      const handle = await ctx.agents.create({
+        sessionId,
+        agentOptions: { provider: 'mock', model: 'mock' },
+      })
+      const reclaim = handle.reclaim
+      if (reclaim === undefined) throw new Error('native loop must expose reclaim')
+      const disposed: SessionId[] = []
+      ctx.on('agent/disposed', ({ agent }) => { disposed.push(agent.id) })
+
+      const hang = Promise.withResolvers<undefined>()
+      const entered = Promise.withResolvers<undefined>()
+      const finished = Promise.withResolvers<undefined>()
+      let flushCalls = 0
+      ctx.on('session/flush', async () => {
+        flushCalls += 1
+        entered.resolve(undefined)
+        await hang.promise
+        finished.resolve(undefined)
+        if (failLate && flushCalls === 1) throw new Error('late flush failure')
+      })
+
+      const timed = reclaim.tryReclaim(async () => true, { timeoutMs: 25 })
+      await entered.promise
+      expect(ctx.agents.retention(handle.agent)?.state).toBe('sealed')
+      await expect(timed).resolves.toEqual({ kind: 'busy', reason: 'background' })
+      expect(ctx.agents.retention(handle.agent)?.state).toBe('open')
+      // The timeout released admission while the stale flush is still pending,
+      // so the same Agent accepts new input.
+      handle.agent.inject(message('accepted while the late flush is pending'))
+      handle.agent.cancel({ kind: 'user' })
+
+      hang.resolve(undefined)
+      await finished.promise
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(disposed).toEqual([])
+      expect(ctx.agents.get(handle.agent.id)).toBe(handle.agent)
+      expect(ctx.agents.retention(handle.agent)?.state).toBe('open')
+      expect(unhandled).toEqual([])
+      // The late settlement neither disposed the Agent nor poisoned admission:
+      // a later attempt still reclaims it.
+      await expect(reclaim.tryReclaim(async () => true)).resolves.toEqual({ kind: 'reclaimed' })
+      expect(disposed).toEqual([sessionId])
+    }
+  })
+
+  it('clears its timeout and seal listeners when the owner signal is already aborted', async () => {
+    const ctx = await harness({ persistent: true })
+    const sessionId = SessionId('reclaim-pre-aborted')
+    const handle = await ctx.agents.create({
+      sessionId,
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    const reclaim = handle.reclaim
+    if (reclaim === undefined) throw new Error('native loop must expose reclaim')
+
+    vi.useFakeTimers()
+    try {
+      const timerBaseline = vi.getTimerCount()
+      await expect(reclaim.tryReclaim(async () => true, {
+        signal: AbortSignal.abort(new Error('already cancelled')),
+        timeoutMs: 60_000,
+      })).resolves.toEqual({ kind: 'busy', reason: 'background' })
+      expect(vi.getTimerCount()).toBe(timerBaseline)
+      expect(ctx.agents.retention(handle.agent)?.state).toBe('open')
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(ctx.agents.get(handle.agent.id)).toBe(handle.agent)
+    handle.agent.inject(message('accepted after a pre-aborted bound'))
+    handle.agent.cancel({ kind: 'user' })
   })
 })
