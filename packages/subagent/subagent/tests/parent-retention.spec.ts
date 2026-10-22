@@ -2,18 +2,20 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import SubagentRuntime from '../src/index.ts'
 import type { SubagentResult, SubagentRun } from '../src/types.ts'
 import { externalTestParent } from './external-activation-helpers.ts'
 import { mountWorkingDirectoryFixture } from './working-directory-fixture.ts'
-import { mountLocalActivations } from './local-activation.ts'
+import { mountLocalActivations, startTestActivation } from './local-activation.ts'
 import { TestSessionQuery } from './test-session-query.ts'
 import { subagentManager } from './manager-internals.ts'
-import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
+import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 
 const complete: SubagentResult = {
   output: [{ type: 'text', text: 'CHILD_RESULT_42' }],
@@ -437,5 +439,112 @@ describe('subagent parent retention', () => {
     expect(ctx.agents.retention(parent)?.leases).toBe(1)
     expect(ctx.agents.sealReclaim(parent)).toBeUndefined()
     expect(ctx.agents.get(parent.id)).toBe(parent)
+  })
+
+  it.each([
+    { outcome: 'its SDK startup rejects after a partial start', failure: 'startup' },
+    { outcome: 'its published SDK cleanup rejects', failure: 'cleanup' },
+  ] as const)('keeps the root lineage pinned when a nested SDK grandchild $outcome', async ({ failure }) => {
+    const ctx = new Context()
+    await mountLocalActivations(ctx)
+    await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(SubagentRuntime)
+    const adapter = new MockAdapter([
+      toolCallResponse('start-grandchild', 'start_grandchild', {}),
+      textResponse('child finished'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+    const rootHandle = await ctx.agents.create({
+      sessionId: SessionId(`nested-retention-root-${failure}`),
+      agentOptions: { provider: 'mock', model: 'mock' },
+    })
+    const root = rootHandle.agent
+
+    let starts = 0
+    let grandchildAlive = false
+    let cleanupAttempted = false
+    const publishedResult = Promise.withResolvers<SubagentResult>()
+    ctx.subagents.registerProvider({
+      name: 'sdk-grandchild',
+      inheritsParentContext: false,
+      capabilities: { agentOptions: false, agentPreset: false, outputSchema: false, depthLimit: false },
+      start: async () => {
+        starts += 1
+        grandchildAlive = true
+        if (failure === 'startup') {
+          throw new AggregateError(
+            [new Error('SDK cleanup outcome unknown')],
+            'SDK grandchild partial startup failed',
+          )
+        }
+        return {
+          id: SessionId('nested-sdk-grandchild'),
+          result: publishedResult.promise,
+          dispose: async () => {
+            cleanupAttempted = true
+            // A settled result can precede backend process shutdown; throw to
+            // expose the unknown cleanup without pretending the backend stopped.
+            publishedResult.resolve(complete)
+            throw new AggregateError(
+              [new Error('SDK cleanup outcome unknown')],
+              'SDK grandchild cleanup failed',
+            )
+          },
+        }
+      },
+    })
+    ctx.subagents.registerProvider({
+      name: 'nested-local',
+      inheritsParentContext: false,
+      capabilities: { agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: true },
+      prepareContinuable: () => Promise.resolve({}),
+    })
+    ctx.tools.register(defineContentToolFixture({
+      name: 'start_grandchild',
+      description: 'Start the nested SDK grandchild',
+      parameters: {},
+      async execute(_args, exec): Promise<ContentBlock[]> {
+        const parent = exec.agent
+        if (parent === undefined) throw new Error('expected the local child Agent')
+        const startGrandchild = () => ctx.subagents.startActivation({
+          provider: 'sdk-grandchild',
+          label: 'nested SDK grandchild',
+          signal: new AbortController().signal,
+          delivery: 'caller',
+          request: { parent, prompt: [{ type: 'text', text: 'work independently' }] },
+        })
+        if (failure === 'cleanup') {
+          const grandchild = await startGrandchild()
+          await grandchild.dispose().catch(() => undefined)
+        } else {
+          try {
+            await startGrandchild()
+          } catch (error: unknown) {
+            if (!(error instanceof AggregateError)) throw error
+          }
+        }
+        return [{ type: 'text', text: 'grandchild handled' }]
+      },
+    }))
+
+    const child = await startTestActivation(ctx, 'nested-local', {
+      parent: root,
+      label: 'nested local child',
+      agentOptions: { provider: 'mock', model: 'mock' },
+      prompt: [{ type: 'text', text: 'start the SDK grandchild, then finish' }],
+    })
+    await child.result
+    // Let the child's natural settlement and handle disposal finish: the
+    // unknown grandchild must protect the root after its own child is gone.
+    await vi.waitFor(() => { expect(ctx.agents.get(child.childId)).toBeUndefined() })
+    expect(starts).toBe(1)
+    expect(grandchildAlive).toBe(true)
+    if (failure === 'cleanup') expect(cleanupAttempted).toBe(true)
+    // The child's own root lease is released with its normal completion; the
+    // failed grandchild's lineage lease is the only one left on the root.
+    expect(ctx.agents.retention(root)?.leases).toBe(1)
+    expect(ctx.agents.sealReclaim(root)).toBeUndefined()
+    expect(ctx.agents.get(root.id)).toBe(root)
   })
 })

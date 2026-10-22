@@ -13,48 +13,51 @@ import type { StructuredAttachment } from './structured.ts'
 import type { SubagentResult, SubagentRun } from './types.ts'
 
 /**
- * Single lifetime owner for one exact-parent usage lease.
+ * Single lifetime owner for the exact-Agent usage leases of one parent lineage.
  *
- * Ordinary release happens once the activation's settlement notice is queued.
- * A failed disposal or child teardown leaves the child's stop unknown; that
- * outcome retains the lease permanently because a settled result can precede
- * backend process shutdown and therefore never proves the child stopped.
- * Release requests from every rollback layer then become no-ops, so idle
- * reclamation cannot reclaim the parent. Resolving that unknown state is an
- * operator action, not an automatic transition.
+ * The direct parent and every live ancestor observed when an activation is
+ * admitted are retained together, so an unknown descendant keeps its whole
+ * ancestor chain pinned. Ordinary release happens once the activation's
+ * settlement notice is queued. A failed disposal or child teardown leaves the
+ * descendant's stop unknown; that outcome retains every lease permanently
+ * because a settled result can precede backend process shutdown and therefore
+ * never proves the descendant stopped. Release requests from every rollback
+ * layer then become no-ops, so idle reclamation cannot reclaim any ancestor.
+ * Resolving that unknown state is an operator action, not an automatic
+ * transition.
  */
 export class ParentLease {
-  private readonly lease: AgentActivityLease
+  private readonly leases: readonly AgentActivityLease[]
   private released = false
   private unconfirmed = false
 
   /**
-   * Take ownership of one exact-parent usage lease.
-   * @param lease - lease acquired from the agent registry.
+   * Take ownership of the exact-Agent usage leases for one parent lineage.
+   * @param leases - leases acquired from the agent registry, direct parent first.
    */
-  constructor(lease: AgentActivityLease) {
-    this.lease = lease
+  constructor(leases: readonly AgentActivityLease[]) {
+    this.leases = [...leases]
   }
 
   /**
-   * Release the parent unless an earlier failure left its stop unconfirmed.
-   * Subsequent calls are no-ops.
+   * Release every lineage lease unless an earlier failure left the descendant's
+   * stop unconfirmed. Subsequent calls are no-ops.
    */
   release(): void {
     if (this.released || this.unconfirmed) return
     this.released = true
-    this.lease.release()
+    for (const lease of this.leases) lease.release()
   }
 
   /**
-   * Permanently retain the lease after a teardown whose outcome is unknown.
+   * Permanently retain every lineage lease after a teardown whose outcome is unknown.
    *
    * A rejected provider start or native create/resume may have begun side
    * effects without confirming their cleanup. Disposal rejection, rollback
    * failure, and child-teardown failure likewise leave open whether the child
-   * still runs. Result settlement or cancellation is not stop proof, so this
-   * lease is never released automatically; an operator must confirm the child
-   * stopped before the parent can be reclaimed.
+   * still runs. Result settlement or cancellation is not stop proof, so these
+   * leases are never released automatically; an operator must confirm the
+   * descendant stopped before any ancestor can be reclaimed.
    */
   markUnconfirmed(): void {
     this.unconfirmed = true
@@ -97,10 +100,11 @@ interface ActivationBase {
   readonly childId: SessionId
   readonly parent: Agent
   /**
-   * Exact-parent usage lease acquired before preparation or materialization.
-   * One lease covers startup, execution, cleanup, and settlement notification;
-   * it is released after the parent result has been queued only when cleanup
-   * was confirmed, and is retained permanently after an unknown teardown.
+   * Exact-parent-and-ancestor usage leases acquired before preparation or
+   * materialization. One set covers the whole lineage across startup,
+   * execution, cleanup, and settlement notification; it is released after the
+   * parent result has been queued only when cleanup was confirmed, and is
+   * retained permanently after an unknown teardown.
    */
   readonly parentLease: ParentLease
   readonly delivery: 'parent' | 'caller'

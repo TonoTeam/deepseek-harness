@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease, AgentHandle, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { ReasoningEffortId, contentHasImage, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
@@ -71,11 +71,12 @@ interface MaterializeBase {
   provider: string
   parent: Agent
   /**
-   * Exact-parent lease acquired by the start or resume operation before its
-   * first await. Ownership transfers to the published Activation; a failure
-   * before materialization starts, or after successful rollback, releases it
-   * here, while a rejected materialization attempt or any failed teardown
-   * retains it unconfirmed. Disposal releases it after the settlement notice.
+   * Exact-parent-and-ancestor leases acquired by the start or resume operation
+   * before its first await. Ownership transfers to the published Activation; a
+   * failure before materialization starts, or after successful rollback,
+   * releases them here, while a rejected materialization attempt or any failed
+   * teardown retains them unconfirmed. Disposal releases them after the
+   * settlement notice.
    */
   parentLease: ParentLease
   signal: AbortSignal
@@ -415,11 +416,11 @@ export class SubagentManager {
     // still creating its child. A turn-scoped delegation does not need this,
     // but the service is also callable outside a turn.
     const releaseHold = this.holdOwnership(parent, childId)
-    // The parent lease starts before directory preparation and provider
-    // preparation, and outlives this method through the Activation.
+    // The parent-and-ancestor leases start before directory preparation and
+    // provider preparation, and outlive this method through the Activation.
     let parentLease: ParentLease
     try {
-      parentLease = new ParentLease(this.ctx.agents.retain(parent))
+      parentLease = this.retainParentLineage(parent)
     } catch (error: unknown) {
       releaseHold()
       throw error
@@ -508,7 +509,7 @@ export class SubagentManager {
     const releaseHold = this.holdOwnership(parent, pendingId)
     let parentLease: ParentLease
     try {
-      parentLease = new ParentLease(this.ctx.agents.retain(parent))
+      parentLease = this.retainParentLineage(parent)
     } catch (error: unknown) {
       releaseHold()
       throw error
@@ -862,6 +863,26 @@ export class SubagentManager {
     return lineage
   }
 
+  /**
+   * Acquire one usage lease for the exact parent and every live ancestor.
+   *
+   * Acquisition is synchronous and runs before the first await, so a detached
+   * or sealed ancestor rejects the new child before its startup side effects. A
+   * partial acquisition unwinds in reverse and leaves no lease behind.
+   * @param parent - exact direct parent whose current lineage is pinned.
+   * @returns the single lifetime owner for the whole lineage.
+   */
+  private retainParentLineage(parent: Agent): ParentLease {
+    const leases: AgentActivityLease[] = []
+    try {
+      for (const agent of this.liveLineage(parent)) leases.push(this.ctx.agents.retain(agent))
+    } catch (error: unknown) {
+      for (const lease of [...leases].reverse()) lease.release()
+      throw error
+    }
+    return new ParentLease(leases)
+  }
+
   /** Return the teardown that closed continuable admission for this agent's lineage. */
   private closingTeardownFor(agent: Agent): Agent | 'manager' | undefined {
     if (this.draining) return 'manager'
@@ -917,7 +938,7 @@ export class SubagentManager {
           } catch (disposeError: unknown) {
             // Disposal failed, so the accepted run may still be executing.
             // Its result can settle before process shutdown, so it is not stop
-            // proof; retain the parent lease for operator handling.
+            // proof; retain the parent lineage leases for operator handling.
             inputs.parentLease.markUnconfirmed()
             throw disposeError
           }
@@ -1046,8 +1067,9 @@ export class SubagentManager {
         await (activation.kind === 'local' ? activation.handle.dispose() : activation.run.dispose())
       } catch (cleanupError: unknown) {
         // Rejection is not proof the execution stopped, and no result signal
-        // can prove process quiescence. Retain the parent lease permanently
-        // for operator handling; every outer rollback release is a no-op.
+        // can prove process quiescence. Retain the parent lineage leases
+        // permanently for operator handling; every outer rollback release is a
+        // no-op.
         activation.parentLease.markUnconfirmed()
         throw cleanupError
       } finally {
@@ -1246,10 +1268,11 @@ export class SubagentManager {
     this.resident.delete(childId)
     activation.releaseSlot()
     const terminal: SubagentResult = failure === undefined ? result : { output: [], stopReason: 'error' }
-    // The lease covers cleanup and the parent-result queueing window. Only a
-    // confirmed cleanup may release it after notifySettlement queues the
-    // parent result; a failed disposal or descendant teardown is retained
-    // permanently because that child can still be executing.
+    // The exact-parent-and-ancestor leases cover cleanup and the parent-result
+    // queueing window. Only a confirmed cleanup may release them after
+    // notifySettlement queues the parent result; a failed disposal or
+    // descendant teardown is retained permanently because that child can still
+    // be executing.
     try {
       this.notifySettlement(activation, result)
     } finally {
@@ -1414,8 +1437,8 @@ export class SubagentManager {
   ): Promise<MessageId> {
     const query = this.requireSessionQuery()
     // Cold resume prepares durable state and materializes a child too, so the
-    // same exact-parent lease starts before the first await.
-    const parentLease = new ParentLease(this.ctx.agents.retain(parent))
+    // same exact-parent-and-ancestor leases start before the first await.
+    const parentLease = this.retainParentLineage(parent)
     try {
       let observation: SessionObservation
       try {
