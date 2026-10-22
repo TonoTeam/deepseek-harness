@@ -18,10 +18,23 @@ it('uses the pinned Playwright executable with isolated Chromium launch settings
   Provider.apply(new Context(), Provider.Config({ mode: 'launch', executablePath: '/custom/chromium', toolCallTimeoutMs: 123 }))
   const options = vi.mocked(mountSessionMcp).mock.calls[0]![1]
   expect(existsSync(options.args[0]!)).toBe(true)
-  expect(options).toMatchObject({ name: 'playwright-mcp', exclusive: false, command: process.execPath, toolCallTimeoutMs: 123 })
+  expect(options).toMatchObject({ name: 'playwright-mcp', exclusive: false, command: process.execPath, toolCallTimeoutMs: 123, startup: 'eager' })
+  expect(options.metadata).toBeUndefined()
   expect(options.env?.PLAYWRIGHT_MCP_CDP_ENDPOINT).toBe('')
   expect(options.args.slice(1)).toEqual(['--browser', 'chromium', '--isolated', '--headless', '--executable-path', '/custom/chromium'])
   expect('default' in Provider).toBe(false)
+})
+
+it('forwards opt-in on-demand launch with metadata-only arguments and rejects attachment use', () => {
+  Provider.apply(new Context(), Provider.Config({ mode: 'launch', startup: 'on-demand', executablePath: '/custom/chromium' }))
+  const options = vi.mocked(mountSessionMcp).mock.calls[0]![1]
+  expect(options.startup).toBe('on-demand')
+  expect(options.args.slice(1)).toEqual(['--browser', 'chromium', '--isolated', '--headless', '--executable-path', '/custom/chromium'])
+  expect(options.metadata?.args.slice(1)).toEqual(['--browser', 'chromium'])
+  expect(() => {
+    Provider.apply(new Context(), Provider.Config({ mode: 'attach', endpoint: 'http://127.0.0.1:9222', startup: 'on-demand' }))
+  }).toThrow('on-demand startup is available only for launch mode')
+  expect(mountSessionMcp).toHaveBeenCalledTimes(1)
 })
 
 it('supports headed launch and attaches without launching a browser or creating a profile', () => {

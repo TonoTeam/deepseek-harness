@@ -18,6 +18,7 @@
 import { Client, type Transport } from '@modelcontextprotocol/client'
 import type { Context } from '@deepseek-ai/cordis'
 import { assertNever, type JsonValue } from '@deepseek-ai/dsh-util-values'
+import { DEFAULT_MAX_INSTRUCTION_BYTES, formatServerInstructions } from './server-context.ts'
 import type { ServerContext } from './server-context.ts'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { createTransport } from './transport.ts'
@@ -44,9 +45,6 @@ export const RECONNECT_DEFAULTS: Required<ReconnectConfig> = Object.freeze({
   maxDelayMs: 30_000,
   maxAttempts: 10,
 })
-
-/** Default UTF-8 byte limit for attributed server instructions. */
-export const DEFAULT_MAX_INSTRUCTION_BYTES = 32_768
 
 // The SDK's stdio transport owns two two-second termination grace periods.
 // Keep one additional second for the process-close event that proves the old
@@ -335,11 +333,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         if (!await closeGeneration()) ctx.logger.error(incompleteDisposalMessage)
         return
       }
-      const serverText = generation.getInstructions()?.trimEnd() ?? ''
-      instructions = serverText ? `### MCP server: ${config.serverName}\n\n${serverText}` : ''
-      if (Buffer.byteLength(instructions) > maxInstructionBytes) {
-        throw new Error(`${label}: server instructions exceed maxInstructionBytes (${maxInstructionBytes})`)
-      }
+      instructions = formatServerInstructions(config.serverName, generation.getInstructions(), maxInstructionBytes)
       await enqueueSync(generation, startup ? startupOpts : opts)
     } catch (error) {
       if (firstAttemptError === undefined) firstAttemptError = error

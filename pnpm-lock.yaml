@@ -7863,9 +7863,15 @@ importers:
 
   packages/experimental/browser-use-runtime:
     dependencies:
+      '@deepseek-ai/dsh-subprocess':
+        specifier: workspace:*
+        version: link:../../subprocess/subprocess
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
+      '@modelcontextprotocol/client':
+        specifier: 2.2.0
+        version: 2.2.0
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~

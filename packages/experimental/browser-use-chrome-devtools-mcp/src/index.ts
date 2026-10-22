@@ -26,18 +26,22 @@ export const Config: typeof BrowserMcpConfig = BrowserMcpConfig
 export function apply(ctx: Context, config: Config): void {
   validateBrowserMcpConfig(config)
   const cli = fileURLToPath(import.meta.resolve('chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js'))
-  const args = [cli, '--no-usage-statistics']
+  const metadata = [cli, '--no-usage-statistics']
+  const args = [...metadata]
   if (config.mode === 'attach') {
     args.push(/^wss?:/u.test(config.endpoint) ? '--ws-endpoint' : '--browser-url', config.endpoint)
   } else {
     args.push('--isolated', `--headless=${String(config.headless)}`)
     if (config.executablePath !== undefined) args.push('--executable-path', config.executablePath)
   }
+  const startup = config.mode === 'attach' ? 'eager' : config.startup ?? 'eager'
   mountSessionMcp(ctx, {
     name: 'chrome-devtools-mcp',
     exclusive: config.mode === 'attach',
     command: process.execPath,
     args,
+    startup,
+    ...startup === 'on-demand' ? { metadata: { args: metadata } } : {},
     ...config.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: config.toolCallTimeoutMs },
   })
 }

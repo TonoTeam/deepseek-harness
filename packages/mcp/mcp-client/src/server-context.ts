@@ -8,6 +8,32 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { McpResourceProvider } from '@deepseek-ai/dsh-mcp-resources'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 
+/** Default UTF-8 byte limit for attributed server instructions. */
+export const DEFAULT_MAX_INSTRUCTION_BYTES = 32_768
+
+/**
+ * Format one server's instructions with the canonical attribution header and
+ * enforce the UTF-8 byte bound over that complete attributed text.
+ * @param server - configured server identity used in the attribution header.
+ * @param text - instructions reported by the server; absent or blank text adds no prompt text.
+ * @param maxBytes - maximum UTF-8 bytes of the complete attributed instruction text.
+ * @returns the attributed instruction block, or an empty string when no server instructions are present.
+ * @throws when the attributed instruction block exceeds `maxBytes`.
+ */
+export function formatServerInstructions(
+  server: string,
+  text: string | undefined,
+  maxBytes: number = DEFAULT_MAX_INSTRUCTION_BYTES,
+): string {
+  const body = text?.trimEnd() ?? ''
+  if (body === '') return ''
+  const instructions = `### MCP server: ${server}\n\n${body}`
+  if (Buffer.byteLength(instructions) > maxBytes) {
+    throw new Error(`MCP server "${server}": server instructions exceed maxInstructionBytes (${maxBytes})`)
+  }
+  return instructions
+}
+
 /** Connection-owned values used by the resource and prompt consumers. */
 export interface ServerContext {
   /** Resource access through the current connection generation. */

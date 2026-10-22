@@ -3,14 +3,27 @@ import { appendFileSync, existsSync, watch } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 
-const [root, mode] = process.argv.slice(2)
+const [root, ...flags] = process.argv.slice(2)
+const mode = flags.find(flag => flag !== 'metadata')
+// A serving child that outlives stdin EOF and SIGTERM forces the SDK's full
+// termination escalation before the close barrier may return.
+const stubborn = mode === 'stubborn'
+const instructions = mode === 'oversized-instructions'
+  ? `BROWSER_FIXTURE_INSTRUCTION: ${'x'.repeat(33_000)}`
+  : 'BROWSER_FIXTURE_INSTRUCTION: use this Session browser.'
 const record = (event, values = {}) => appendFileSync(join(root, 'events.ndjson'), JSON.stringify({ event, pid: process.pid, ...values }) + '\n')
 const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
 let counter = 0
-record('start', { cwd: process.cwd() })
+record('start', { cwd: process.cwd(), argv: process.argv.slice(2) })
 process.once('exit', () => record('exit'))
+if (stubborn) {
+  process.on('SIGTERM', () => record('signal', { signal: 'SIGTERM' }))
+  // A signal listener does not keep Node alive; stdin EOF must not end the
+  // process before the SDK escalates to SIGKILL.
+  setInterval(() => {}, 1000)
+} else process.once('SIGTERM', () => process.exit(0))
 const lines = createInterface({ input: process.stdin })
-lines.once('close', () => process.exit(0))
+if (!stubborn) lines.once('close', () => process.exit(0))
 lines.on('line', line => {
   const request = JSON.parse(line)
   if (request.id === undefined) return
@@ -37,15 +50,19 @@ lines.on('line', line => {
       if (mode === 'hold') return
       reply(request.id, {
         protocolVersion: request.params.protocolVersion, capabilities: { tools: {}, resources: {} },
-        serverInfo: { name: 'browser-fixture', version: '1' }, instructions: 'BROWSER_FIXTURE_INSTRUCTION: use this Session browser.',
+        serverInfo: { name: 'browser-fixture', version: '1' }, instructions,
       })
       break
-    case 'tools/list':
+    case 'tools/list': {
+      const inputSchema = mode === 'drift'
+        ? { type: 'object', properties: { drifted: { type: 'boolean' } }, additionalProperties: false }
+        : { type: 'object', properties: { label: { type: 'string' } }, required: ['label'], additionalProperties: false }
       reply(request.id, { tools: [
-        { name: 'visit', description: 'Visit the fixture page.', inputSchema: { type: 'object', properties: { label: { type: 'string' } }, required: ['label'], additionalProperties: false } },
+        { name: 'visit', description: 'Visit the fixture page.', inputSchema },
         { name: 'disconnect', description: 'Disconnect the fixture.', inputSchema: { type: 'object', properties: {} } },
       ] })
       break
+    }
     case 'tools/call':
       record('call', { name: request.params.name, cwd: process.cwd() })
       if (request.params.name === 'disconnect') process.exit(0)

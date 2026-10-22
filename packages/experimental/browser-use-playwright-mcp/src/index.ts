@@ -32,7 +32,8 @@ export function apply(ctx: Context, config: Config): void {
   const env = Object.fromEntries(Object.keys(process.env)
     .filter(key => key.toUpperCase().startsWith('PLAYWRIGHT_MCP_'))
     .map(key => [key, '']))
-  const args = [cli, '--browser', 'chromium']
+  const metadata = [cli, '--browser', 'chromium']
+  const args = [...metadata]
   if (config.mode === 'attach') {
     args.push('--cdp-endpoint', config.endpoint)
   } else {
@@ -40,12 +41,15 @@ export function apply(ctx: Context, config: Config): void {
     if (config.headless) args.push('--headless')
     if (config.executablePath !== undefined) args.push('--executable-path', config.executablePath)
   }
+  const startup = config.mode === 'attach' ? 'eager' : config.startup ?? 'eager'
   mountSessionMcp(ctx, {
     name: 'playwright-mcp',
     exclusive: config.mode === 'attach',
     command: process.execPath,
     args,
     env,
+    startup,
+    ...startup === 'on-demand' ? { metadata: { args: metadata } } : {},
     ...config.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: config.toolCallTimeoutMs },
   })
 }
