@@ -9,7 +9,7 @@ kind: "package-library"
 
 ## 概述
 
-浏览器提供方使用此库，在一个 Session 的多个轮次之间复用浏览器，并在该 Session 的运行时释放时关闭其资源。一个 Session 的操作按顺序运行，隔离的 Session 则可以独立推进。附加模式将一个外部浏览器保留给单个 Session。此库还连接提供方拥有的 MCP 服务器，并在 Session 首次模型请求前发现其工具。
+浏览器提供方使用此库，在一个 Session 的多个轮次之间复用浏览器，并在该 Session 的运行时释放时关闭其资源。一个 Session 的操作按顺序运行，隔离的 Session 则可以独立推进。附加模式将一个外部浏览器保留给单个 Session。此库还连接提供方拥有的 MCP 服务器，并在 Session 首次模型请求前发现其工具。启用可选的 `startup: on-demand` 后，独立浏览器的目录与指导仍在首次模型请求前就绪，但服务进程要到该 Session 首次使用浏览器工具或资源时才启动。
 
 ## 目录
 
@@ -31,6 +31,8 @@ kind: "package-library"
 
 MCP 提供方使用 `@deepseek-ai/dsh-experimental-browser-use-runtime/mcp` 中的 `mountSessionMcp`，提供固定服务器名称、可执行文件、参数与所有权策略。挂载上下文必须提供 `workingDirectory`。获取连接时通过[工作目录服务](../../session/working-directory/README.zh.md)验证或恢复当前目录，并将其设为 MCP 服务器进程的初始目录。Session 后续选择其他目录时，保留的服务器继续使用该目录。辅助库在每个后续 Agent 的 `agent/created` 事件中等待一次有作用域的客户端启动与发现尝试。Agent 创建或恢复在发现完成后结束，随后才运行排队输入；成功的客户端跨轮次归该 Session 所有。
 
+`startup: 'on-demand'` 仅适用于启动模式。辅助库此时用单独的 `metadata.args` 运行一次提供方拥有的元数据连接：只做初始化与工具列举，使用中性临时目录，不调用任何工具，也不创建浏览器配置。该目录及其归属指导不可变，并注册给每个后续 Agent，因此创建与恢复仍在排队输入运行前结束。在对应 Agent 首次调用浏览器工具或资源前不存在服务进程；该调用通过 Session 队列打开一个 SDK 连接，并发调用共享这次打开，后续轮次复用该连接。分发前，辅助库把服务进程的原始工具名与输入 schema 同元数据目录比较，不一致时拒绝调用。断开连接的服务进程不会重启，因此浏览器操作绝不会被重放。附加模式保持急切启动，并拒绝按需配置。
+
 附加连接被占用时，本次激活永久跳过启动，但其他工作继续运行。连接释放不会触发被跳过激活的重试；新创建或恢复的 Agent 可以获取连接。启动失败或取消会拒绝 Agent 创建或恢复，并触发包含客户端清理的创建回滚。重连已禁用。加载或重新加载提供方只作用于后续的 Agent 激活。
 
 调用方在等待 Agent 创建或恢复完成后，即可检查提示词组装和作用域工具定义。
@@ -49,7 +51,7 @@ MCP 提供方使用 `@deepseek-ai/dsh-experimental-browser-use-runtime/mcp` 中�
 
 因释放而取消时，在 AgentHandle 等待空闲前开始资源清理。清理先关闭资源再等待运行中的操作，使连接清理能够中断不支持 abort 的上游 API。关闭失败会拒绝释放并保留所有权。Agent 作用域清理防止使用同一持久 id 恢复的 Session 继承之前的浏览器。
 
-[MCP 辅助库](src/mcp.ts)在串行 `agent/created` 中建立连接；[AgentLoop](../../core/agent-loop/README.zh.md#understand-the-implementation)保留排队输入并负责创建回滚。提示词组装读取已初始化的目录。辅助库在资源清理期间保留提供方注册，并通过 [MCP 客户端](../../mcp/mcp-client/README.zh.md)处理传输、schema 发现、结果转换与持久图像接纳。
+[MCP 辅助库](src/mcp.ts)在串行 `agent/created` 中建立连接；[AgentLoop](../../core/agent-loop/README.zh.md#understand-the-implementation)保留排队输入并负责创建回滚。提示词组装读取已初始化的目录。辅助库在资源清理期间保留提供方注册，并通过 [MCP 客户端](../../mcp/mcp-client/README.zh.md)处理传输、schema 发现、结果转换与持久图像接纳。按需启动直接复用同一套 SDK stdio 传输与清洗后的环境：短暂的元数据连接在列举完成后关闭，每个 Agent 的 `SessionResources` 条目在首次使用时打开其服务客户端。
 
 </details>
 
@@ -67,7 +69,7 @@ MCP 提供方使用 `@deepseek-ai/dsh-experimental-browser-use-runtime/mcp` 中�
 <a id="model-experience"></a>
 ## 模型体验
 
-通过在模型请求组装前发现的提供方浏览器工具，以及[工作目录恢复](../../session/working-directory/README.zh.md)间接影响模型；提供方与 MCP 客户端拥有工具描述、schema、结果与图像行为，目录服务拥有目录上下文。
+通过在模型请求组装前发现的提供方浏览器工具，以及[工作目录恢复](../../session/working-directory/README.zh.md)间接影响模型；提供方与 MCP 客户端拥有工具描述、schema、结果与图像行为，目录服务拥有目录上下文。按需启动只改变服务进程的启动时机，不改变模型看到的目录。
 
 #### KV Cache 影响
 
@@ -83,6 +85,7 @@ MCP 提供方使用 `@deepseek-ai/dsh-experimental-browser-use-runtime/mcp` 中�
 - **附加范围** — 独占所有权作用于一个资源管理器，不约束独立提供方、进程或外部浏览器客户端。
 - **取消** — abort 信号与连接关闭无法撤销已交付的浏览器操作。同时忽略两者的上游操作可能延迟清理。
 - **恢复** — 关闭失败会保留所有权；此管理器不重试释放，也不从 Session 日志恢复浏览器状态。
+- **按需目录** — 只有在分发工具调用时才会比较服务目录。DSH 在启动后不再轮询它，因此运行中改变工具的服务器会保留元数据定义，并拒绝与目录不符的调用。
 - **共享宿主运行时** — profile 会把本包与 dsh 安装并排安装，因此 `@deepseek-ai/dsh-scope` 与 `@deepseek-ai/dsh-mcp-client` 保持为 peer 依赖。写成 `dependencies` 会再装一份 `dsh-scope`，它的作用域标记宿主注册表读不到：每个 Agent 的 MCP 工具都会注册到全局工具层，第二个 Agent 的创建随之失败。
 
 <a id="dev-note"></a>

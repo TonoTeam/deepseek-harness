@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Use Playwright MCP to inspect pages and operate Chromium through its upstream tools. The provider initializes a Session's MCP connection before creation or resume completes and retains it across turns. Launch a separate browser or attach one Session to an existing browser with its current tabs and login state. This published experimental package activates only when explicitly mounted.
+Use Playwright MCP to inspect pages and operate Chromium through its upstream tools. The provider makes a Session's upstream catalogue available before creation or resume completes and retains its serving connection across turns. Launch a separate browser or attach one Session to an existing browser with its current tabs and login state. Launch mode can opt into starting the serving process on the Session's first browser call. This published experimental package activates only when explicitly mounted.
 
 ## Table of Contents
 
@@ -37,9 +37,12 @@ Mount both entries before creating or resuming a Session, in a profile compositi
 
 Use `mode: attach` and set `endpoint` to an HTTP(S) debugging URL or WS(S) browser endpoint to operate an existing browser. The new live Session claims the attachment during initialization and retains it until unloading. If the attachment is busy, that activation continues without this browser and does not retry on later turns. After release, a newly created or resumed activation can acquire it. Direct calls from another Session fail. Cleanup disconnects and leaves the external browser and its pages running.
 
+Launch mode also accepts `startup: on-demand`. The provider then runs one transient metadata process with only the pinned CLI and browser selection, registers the discovered catalogue and instructions for each future Session, and starts that Session's own Playwright browser process on its first browser tool or resource call; later turns reuse it. The metadata process never calls a browser tool and does not create a profile. `mode: attach` requires eager startup and rejects `startup: on-demand`.
+
 | Field | Default | Meaning |
 |---|---|---|
 | `mode` | required | `launch` or `attach`, fixed for this provider activation |
+| `startup` | `eager` | Launch mode: start the server during creation (`eager`) or on the first browser call (`on-demand`); attachment requires `eager` |
 | `headless` | `true` | Launch without a visible window |
 | `executablePath` | upstream discovery | Chromium executable for launch |
 | `endpoint` | required for attach | Existing browser debugging endpoint |
@@ -57,7 +60,7 @@ When configuring the system prompt's `toolOrder` for the whole process, leave br
 <details>
 <summary>Implementation internals — click to expand</summary>
 
-The provider resolves its pinned npm entry and starts it under the current Node executable. A temporary protocol probe may precede the serving process. The [shared runtime](../browser-use-runtime/README.md) owns awaited Agent initialization, per-Session serialization, and cleanup; the [MCP client](../../mcp/mcp-client/README.md) owns transport, discovery, and result projection.
+The provider resolves its pinned npm entry and starts it under the current Node executable. SDK version negotiation may run a temporary probe before a serving process; on-demand startup additionally runs one metadata-only process whose catalogue is registered before model requests. The [shared runtime](../browser-use-runtime/README.md) owns awaited Agent initialization, per-Session serialization, and cleanup; the [MCP client](../../mcp/mcp-client/README.md) owns result projection, while the runtime reuses its public tool-definition and server-context exports over the SDK stdio transport.
 
 Browser state survives turns while its live Session remains attached. The MCP server starts in the Session's validated current working directory and retains that launch directory after later Session directory changes. Disposal waits for server shutdown before releasing resources. Resume after reload starts fresh browser runtime state; stored conversation history does not restore cookies or pages.
 
@@ -98,7 +101,7 @@ An unchanged catalog preserves its tool-definition prefix. Results append to his
 The integration retains the pinned server's browser and tool restrictions.
 
 - Chromium only; Firefox and WebKit are not selectable.
-- Startup failure or cancellation rejects Session creation or resume and triggers client cleanup. A disconnected client is not retried; after fixing the cause, create a new Session or unload and resume the existing one.
+- Startup failure or cancellation rejects Session creation or resume and triggers client cleanup. With on-demand startup, a failed first browser call reports the error without retrying; a disconnected or drifted serving process is not replaced. After fixing the cause, create a new Session or unload and resume the existing one.
 - Attachment exclusivity is local to this provider instance. Other processes and browser users can still modify the same pages.
 - The shared resource-server inventory can show inherited server names; it does not grant access to another Session's browser.
 - Cancellation does not undo navigation, clicks, or other actions already delivered to the browser.

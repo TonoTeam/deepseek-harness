@@ -42,7 +42,9 @@
     "@deepseek-ai/dsh-working-directory": "workspace:*"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "workspace:~"
+    "@deepseek-ai/dsh-subprocess": "workspace:*",
+    "@deepseek-ai/schemastery": "workspace:~",
+    "@modelcontextprotocol/client": "2.2.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "workspace:~",

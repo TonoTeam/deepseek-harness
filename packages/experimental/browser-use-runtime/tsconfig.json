@@ -27,6 +27,9 @@
       "path": "../../mcp/mcp-client"
     },
     {
+      "path": "../../subprocess/subprocess"
+    },
+    {
       "path": "../../browser-use/browser-use"
     },
     {

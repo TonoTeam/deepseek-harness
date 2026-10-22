@@ -64,17 +64,20 @@ class PresentationRuntime extends PtcRuntime {
   run(): Promise<never> { return Promise.reject(new Error('Unexpected PTC execution in a presentation test')) }
 }
 
-async function load(exclusive = false, mode?: string, toolCallTimeoutMs?: number, toolOrder?: string[]) {
+async function load(exclusive = false, mode?: string, toolCallTimeoutMs?: number, toolOrder?: string[], startup?: 'on-demand', metadataMode?: string) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-browser-mcp-'))
   roots.push(root)
   const model = new FixtureModel()
+  const metadata = startup === 'on-demand'
+    ? { startup, metadata: { args: [fixture, root, 'metadata', ...metadataMode === undefined ? [] : [metadataMode]] } }
+    : {}
   const modules = new Map<string, unknown>([
     ['browserUse', BrowserUse], ['prompt', SystemPrompt], ['tools', Tools], ['llm', Llm],
     ['sessions', Sessions], ['agents', Agents], ['loop', AgentLoop], ['projections', Projections],
     ['fs', LocalFileSystem], ['workingDirectory', WorkingDirectory],
     ['model', { inject: ['llm'], apply(ctx: Context) { ctx.effect(() => ctx.llm.registerAdapter(['fixture'], model)) } }],
     ['browser', { inject: ['browserUse', 'agents', 'tools', 'systemPrompt', 'workingDirectory'], apply(ctx: Context) {
-      mountSessionMcp(ctx, { name: 'browser-fixture', exclusive, command: process.execPath, args: [fixture, root, ...mode === undefined ? [] : [mode]], ...toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs, env: {} } })
+      mountSessionMcp(ctx, { name: 'browser-fixture', exclusive, command: process.execPath, args: [fixture, root, ...mode === undefined ? [] : [mode]], ...metadata, ...toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs, env: {} } })
     } }],
   ])
   const configPath = join(root, 'cordis.yml')
@@ -129,19 +132,32 @@ function registerIndependentTool(ctx: Context) {
 }
 
 async function events(root: string) {
-  return (await readFile(join(root, 'events.ndjson'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { event: string; pid: number; name?: string; cwd?: string })
+  return (await readFile(join(root, 'events.ndjson'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { event: string; pid: number; name?: string; cwd?: string; argv?: string[] })
+}
+
+/** Wait for the fixture's own exit records, then confirm the kernel no longer holds each pid. */
+async function observeExits(root: string, pids: number[]) {
+  await vi.waitFor(async () => {
+    const exited = new Set((await events(root)).filter(event => event.event === 'exit').map(event => event.pid))
+    for (const pid of pids) expect(exited.has(pid)).toBe(true)
+  }, { timeout: 5000 })
+  for (const pid of pids) {
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+  }
 }
 
 it('requires a browser mode and validates launch and attachment settings', () => {
   expect(BrowserMcpConfig({ mode: 'launch' })).toEqual({ mode: 'launch', headless: true })
   expect(BrowserMcpConfig({ mode: 'launch', headless: false, executablePath: '/chromium', toolCallTimeoutMs: 12 })).toMatchObject({ headless: false, toolCallTimeoutMs: 12 })
+  expect(BrowserMcpConfig({ mode: 'launch', startup: 'on-demand' })).toMatchObject({ mode: 'launch', startup: 'on-demand' })
   expect(BrowserMcpConfig({ mode: 'attach', endpoint: 'wss://browser.example/devtools/browser/id' })).toMatchObject({ mode: 'attach' })
-  for (const invalid of [{}, { mode: 'attach' }, { mode: 'attach', endpoint: 'file:///tmp/browser' }, { mode: 'launch', toolCallTimeoutMs: 0 }, { mode: 'launch', executablePath: '' }]) {
+  for (const invalid of [{}, { mode: 'attach' }, { mode: 'attach', endpoint: 'file:///tmp/browser' }, { mode: 'launch', toolCallTimeoutMs: 0 }, { mode: 'launch', executablePath: '' }, { mode: 'launch', startup: 'sometimes' }]) {
     expect(() => BrowserMcpConfig(invalid as never)).toThrow()
   }
   for (const endpoint of ['http://localhost:bad/path', 'http://localhost trailing-junk', 'file:///tmp/browser', 'http://localhost/ ']) {
     expect(() => { validateBrowserMcpConfig({ mode: 'attach', endpoint }) }).toThrow('browser endpoint')
   }
+  expect(() => { validateBrowserMcpConfig({ mode: 'attach', endpoint: 'http://127.0.0.1:9222', startup: 'on-demand' }) }).toThrow('on-demand startup is available only for launch mode')
 })
 
 it('waits for SystemPrompt and ToolRuntime before reserving the provider', async () => {
@@ -609,5 +625,189 @@ describe('Session MCP Loader composition', () => {
     expect((await warm(ctx, future.agent)).tools.some(tool => tool.name === TOOL)).toBe(true)
     expect((await execute(ctx, existing.agent)).isError).toBe(true)
     expect((await execute(ctx, future.agent)).isError).toBe(false)
+  })
+})
+
+describe('on-demand Session MCP startup', () => {
+  it('registers one metadata catalogue for every Agent and starts a server only for the calling Agent', async () => {
+    const { ctx, root, model, browser } = await load(false, undefined, 5000, [TOOL, '<unlisted-tools>'], 'on-demand')
+    const secondDirectory = join(root, 'second-agent')
+    await mkdir(secondDirectory)
+    const first = await ctx.agents.create({ sessionId: SessionId('first'), meta: { cwd: root }, agentOptions: { provider: 'fixture', model: 'fixture' } })
+    const second = await ctx.agents.create({ sessionId: SessionId('second'), meta: { cwd: secondDirectory } })
+    expect(ctx.tools.schemas()).toEqual([])
+    for (const { agent } of [first, second]) {
+      expect(ctx.tools.schemas(agent).map(schema => schema.name)).toContain(TOOL)
+      expect(renderPrompt(await warm(ctx, agent))).toContain('BROWSER_FIXTURE_INSTRUCTION')
+    }
+    const discovered = await events(root)
+    const metadataStarts = discovered.filter(event => event.event === 'start')
+    expect(metadataStarts).toHaveLength(2)
+    expect(discovered.filter(event => event.event === 'probe')).toHaveLength(1)
+    expect(discovered.filter(event => event.event === 'initialize')).toHaveLength(1)
+    expect(discovered.filter(event => event.event === 'call')).toEqual([])
+    for (const start of metadataStarts) {
+      expect(start.argv).toEqual([root, 'metadata'])
+      expect(start.cwd).toBe(await realpath(tmpdir()))
+    }
+    await observeExits(root, metadataStarts.map(event => event.pid))
+    expect(ctx.tools.schemas(second.agent).map(schema => schema.name)).toContain(TOOL)
+
+    first.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Visit the fixture.' }], source: { kind: 'user' } }))
+    await first.agent.whenIdle()
+    expect(model.requests).toHaveLength(2)
+    expect(model.requests[0]?.tools?.find(tool => tool.name === TOOL)).toMatchObject({ description: 'Visit the fixture page.' })
+    expect(JSON.stringify(first.agent.session.snapshotEvents())).toContain('Visit 1: fixture')
+    const served = await events(root)
+    const firstInitialization = served.filter(event => event.event === 'initialize')
+    expect(firstInitialization).toHaveLength(2)
+    const servingStart = served.find(event => event.event === 'start' && event.pid === firstInitialization.at(-1)?.pid)
+    expect(servingStart?.cwd).toBe(await realpath(root))
+    expect(served.filter(event => event.event === 'call')).toHaveLength(1)
+
+    first.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'Visit once more.' }], source: { kind: 'user' } }))
+    await first.agent.whenIdle()
+    expect(model.requests).toHaveLength(4)
+    expect(JSON.stringify(first.agent.session.snapshotEvents())).toContain('Visit 2: fixture')
+    expect((await events(root)).filter(event => event.event === 'initialize')).toHaveLength(2)
+    expect((await execute(ctx, first.agent)).content).toEqual([{ type: 'text', text: 'Visit 3: direct' }])
+    const retained = await events(root)
+    expect(retained.filter(event => event.event === 'start')).toHaveLength(4)
+    expect(retained.filter(event => event.event === 'initialize')).toHaveLength(2)
+    expect(new Set(retained.filter(event => event.event === 'call').map(event => event.pid)).size).toBe(1)
+    expect(ctx.tools.schemas(second.agent).map(schema => schema.name)).toContain(TOOL)
+
+    const servingPid = retained.find(event => event.event === 'call')!.pid
+    await execute(ctx, first.agent, 'mcp__browser-fixture__disconnect')
+    await vi.waitFor(() => { expect(() => process.kill(servingPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' })) })
+    expect((await execute(ctx, first.agent)).isError).toBe(true)
+    expect((await events(root)).filter(event => event.event === 'initialize')).toHaveLength(2)
+    await browser.dispose()
+    await observeExits(root, (await events(root)).filter(event => event.event === 'start').map(event => event.pid))
+  })
+
+  it('starts a serving process on the owning Agent\'s first resource call without an earlier tool call', async () => {
+    const { ctx, root } = await load(false, undefined, 5000, undefined, 'on-demand')
+    await ctx.plugin(McpResources)
+    const owner = await ctx.agents.create({ sessionId: SessionId('resource-owner'), meta: { cwd: root } })
+    const other = await ctx.agents.create({ sessionId: SessionId('resource-other') })
+    expect((await events(root)).filter(event => event.event === 'start')).toHaveLength(2)
+    const ownerState = browserState(await resource(ctx, owner.agent))
+    expect(ownerState.counter).toBe(0)
+    let recorded = await events(root)
+    expect(recorded.filter(event => event.event === 'start')).toHaveLength(4)
+    const otherState = browserState(await resource(ctx, other.agent))
+    expect(otherState.counter).toBe(0)
+    expect(otherState.pid).not.toBe(ownerState.pid)
+    recorded = await events(root)
+    expect(recorded.filter(event => event.event === 'start')).toHaveLength(6)
+    expect(recorded.filter(event => event.event === 'call')).toEqual([])
+    expect(recorded.filter(event => event.event === 'resource')).toHaveLength(2)
+    await owner.dispose()
+    await other.dispose()
+    await observeExits(root, recorded.filter(event => event.event === 'start').map(event => event.pid))
+  })
+
+  it('confirms a stubborn child exited before provider teardown returns', async () => {
+    const { ctx, root, browser } = await load(false, 'stubborn', 5000, undefined, 'on-demand')
+    const owner = await ctx.agents.create({ sessionId: SessionId('stubborn-child'), meta: { cwd: root } })
+    expect((await execute(ctx, owner.agent)).isError).toBe(false)
+    const servingPid = (await events(root)).find(event => event.event === 'call')!.pid
+    await browser.dispose()
+    expect(() => process.kill(servingPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }))
+    expect((await events(root)).some(event => event.event === 'signal')).toBe(true)
+  }, 15_000)
+
+  it('single-flights concurrent first calls and retains browser state across calls', async () => {
+    const { ctx, root } = await load(false, undefined, 5000, undefined, 'on-demand')
+    const owner = await ctx.agents.create({ sessionId: SessionId('singleflight'), meta: { cwd: root } })
+    const call = (label: string) => ctx.tools.execute({
+      agent: owner.agent, name: TOOL, arguments: { label }, callId: ToolCallId(label), signal: new AbortController().signal,
+    })
+    const results = await Promise.all([call('first'), call('second')])
+    expect(results.map(result => result.isError)).toEqual([false, false])
+    expect(results.map(result => result.content)).toEqual([
+      [{ type: 'text', text: 'Visit 1: first' }],
+      [{ type: 'text', text: 'Visit 2: second' }],
+    ])
+    const recorded = await events(root)
+    expect(recorded.filter(event => event.event === 'initialize')).toHaveLength(2)
+    const calls = recorded.filter(event => event.event === 'call')
+    expect(calls).toHaveLength(2)
+    expect(new Set(calls.map(event => event.pid)).size).toBe(1)
+    await owner.dispose()
+    await observeExits(root, recorded.filter(event => event.event === 'start').map(event => event.pid))
+  })
+
+  it('fails closed when the serving catalogue differs from metadata', async () => {
+    const { ctx, root } = await load(false, 'drift', 5000, undefined, 'on-demand')
+    const owner = await ctx.agents.create({ sessionId: SessionId('drift'), meta: { cwd: root } })
+    const result = await execute(ctx, owner.agent)
+    expect(result.isError).toBe(true)
+    expect(JSON.stringify(result.content)).toContain('catalogue changed after metadata discovery')
+    const recorded = await events(root)
+    expect(recorded.filter(event => event.event === 'call')).toEqual([])
+    expect(recorded.filter(event => event.event === 'initialize')).toHaveLength(2)
+    await owner.dispose()
+    await observeExits(root, recorded.filter(event => event.event === 'start').map(event => event.pid))
+  })
+
+  it('reaps metadata discovery and failed serving startup children', async () => {
+    const held = await load(false, undefined, undefined, undefined, 'on-demand', 'hold')
+    const heldRejected = expect(held.ctx.agents.create({ sessionId: SessionId('held-metadata') })).rejects.toThrow()
+    await vi.waitFor(async () => { expect((await events(held.root)).some(event => event.event === 'probe')).toBe(true) }, { timeout: 5000 })
+    const heldStarts = (await events(held.root)).filter(event => event.event === 'start')
+    expect(heldStarts.length).toBeGreaterThan(0)
+    await held.browser.dispose()
+    await heldRejected
+    await observeExits(held.root, heldStarts.map(event => event.pid))
+    expect(held.ctx.agents.get(SessionId('held-metadata'))).toBeUndefined()
+
+    const broken = await load(false, undefined, undefined, undefined, 'on-demand', 'fail')
+    await expect(broken.ctx.agents.create({ sessionId: SessionId('failed-metadata') })).rejects.toThrow()
+    await observeExits(broken.root, (await events(broken.root)).filter(event => event.event === 'start').map(event => event.pid))
+    expect(broken.ctx.agents.get(SessionId('failed-metadata'))).toBeUndefined()
+
+    // A failed probe clears only its own cache entry, so a later explicit
+    // activation retries discovery instead of reusing the rejection.
+    const failedStarts = (await events(broken.root)).filter(event => event.event === 'start').length
+    await expect(broken.ctx.agents.create({ sessionId: SessionId('failed-metadata-retry') })).rejects.toThrow()
+    expect((await events(broken.root)).filter(event => event.event === 'start').length).toBeGreaterThan(failedStarts)
+    await observeExits(broken.root, (await events(broken.root)).filter(event => event.event === 'start').map(event => event.pid))
+    expect(broken.ctx.agents.get(SessionId('failed-metadata-retry'))).toBeUndefined()
+
+    const oversized = await load(false, undefined, undefined, undefined, 'on-demand', 'oversized-instructions')
+    await expect(oversized.ctx.agents.create({ sessionId: SessionId('oversized-metadata') }))
+      .rejects.toThrow('server instructions exceed maxInstructionBytes (32768)')
+    await observeExits(oversized.root, (await events(oversized.root)).filter(event => event.event === 'start').map(event => event.pid))
+    expect(oversized.ctx.agents.get(SessionId('oversized-metadata'))).toBeUndefined()
+
+    const failed = await load(false, 'fail', 5000, undefined, 'on-demand')
+    const owner = await failed.ctx.agents.create({ sessionId: SessionId('failed-serving'), meta: { cwd: failed.root } })
+    expect((await execute(failed.ctx, owner.agent)).isError).toBe(true)
+    const recorded = await events(failed.root)
+    expect(recorded.filter(event => event.event === 'call')).toEqual([])
+    await observeExits(failed.root, recorded.filter(event => event.event === 'start').map(event => event.pid))
+  })
+
+  it('closes in-flight serving startup and a live browser on provider teardown', async () => {
+    const gated = await load(false, 'gate', 5000, undefined, 'on-demand')
+    const gatedOwner = await gated.ctx.agents.create({ sessionId: SessionId('gated-serving'), meta: { cwd: gated.root } })
+    const executing = execute(gated.ctx, gatedOwner.agent)
+    await vi.waitFor(async () => {
+      expect((await events(gated.root)).filter(event => event.event === 'start')).toHaveLength(3)
+    }, { timeout: 5000 })
+    const gatedStarts = (await events(gated.root)).filter(event => event.event === 'start')
+    await gated.browser.dispose()
+    expect((await executing).isError).toBe(true)
+    await observeExits(gated.root, gatedStarts.map(event => event.pid))
+
+    const live = await load(false, undefined, 5000, undefined, 'on-demand')
+    const liveOwner = await live.ctx.agents.create({ sessionId: SessionId('live-serving'), meta: { cwd: live.root } })
+    expect((await execute(live.ctx, liveOwner.agent)).isError).toBe(false)
+    const liveStarts = (await events(live.root)).filter(event => event.event === 'start')
+    expect(liveStarts).toHaveLength(4)
+    await live.browser.dispose()
+    await observeExits(live.root, liveStarts.map(event => event.pid))
   })
 })

@@ -22,13 +22,14 @@ import Projections from '@deepseek-ai/dsh-session-projection'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 import { expect, vi } from 'vitest'
-import type { BrowserMcpConfig } from '../src/mcp.ts'
+import type { BrowserMcpConfig, BrowserMcpStartup } from '../src/mcp.ts'
 
 export async function verifyMcpBrowser(
   provider: Pick<Plugin.Object<BrowserMcpConfig>, 'apply'>,
   namespace: string,
   navigate: { name: string; arguments(url: string): Record<string, unknown> },
   mode: 'launch' | 'attach',
+  startup: BrowserMcpStartup = 'eager',
 ): Promise<void> {
   const executable = process.env.DSH_BROWSER_EXECUTABLE!
   const root = await mkdtemp(join(tmpdir(), 'dsh-browser-upstream-'))
@@ -47,7 +48,12 @@ export async function verifyMcpBrowser(
     const address = server.address()
     if (address === null || typeof address === 'string') throw new Error('Fixture has no TCP listener')
     const url = `http://127.0.0.1:${address.port}/${namespace}-${mode}`
-    let browserConfig: BrowserMcpConfig = { mode: 'launch', headless: true, executablePath: executable }
+    // On-demand startup must still expose the metadata catalogue before this
+    // first call; the loopback navigation then proves the serving process ran.
+    let browserConfig: BrowserMcpConfig = {
+      mode: 'launch', headless: true, executablePath: executable,
+      ...startup === 'eager' ? {} : { startup },
+    }
     if (mode === 'attach') {
       const profile = join(root, 'external-profile')
       external = spawn(executable, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: 'ignore' })

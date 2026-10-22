@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-通过 Chrome DevTools MCP 的上游工具检查网页并操作 Chromium。提供方在 Session 创建或恢复完成前初始化其 MCP 连接，并跨轮次保留连接。可以启动独立浏览器，也可以让一个 Session 接入已有浏览器，使用其现有标签页和登录状态。本包以实验状态发布，仅在显式挂载后启用。
+通过 Chrome DevTools MCP 的上游工具检查网页并操作 Chromium。提供方在 Session 创建或恢复完成前让其上游目录可用，并跨轮次保留服务连接。可以启动独立浏览器，也可以让一个 Session 接入已有浏览器，使用其现有标签页和登录状态。启动模式可选择在该 Session 首次浏览器调用时才启动服务进程。本包以实验状态发布，仅在显式挂载后启用。
 
 ## 目录
 
@@ -37,9 +37,12 @@ kind: "package-reference"
 
 使用 `mode: attach`，并在 `endpoint` 中设置 HTTP(S) 调试 URL 或 WS(S) 浏览器端点，即可操作已有浏览器。新的活动 Session 在初始化时占用附加连接，并持续保留直到卸载。如果连接已被占用，本次激活不使用该浏览器，但继续运行，后续轮次不会重试。连接释放后，新创建或恢复的激活可以获取它。其他 Session 的直接调用会失败。清理只断开连接，保留外部浏览器及其页面。
 
+启动模式还接受 `startup: on-demand`。提供方此时只用固定的 CLI 与使用统计设置运行一次短暂元数据进程，把发现的目录与指导注册给每个后续 Session，并在该 Session 首次调用浏览器工具或资源时才启动其自己的 Chrome DevTools 进程；后续轮次复用它。元数据进程不调用任何浏览器工具，也不创建配置。`mode: attach` 要求急切启动，并拒绝 `startup: on-demand`。
+
 | 字段 | 默认值 | 含义 |
 |---|---|---|
 | `mode` | 必填 | `launch` 或 `attach`，在本次提供方激活期间固定 |
+| `startup` | `eager` | 启动模式：创建期间启动服务（`eager`），或首次浏览器调用时启动（`on-demand`）；附加模式要求 `eager` |
 | `headless` | `true` | 启动时不显示窗口 |
 | `executablePath` | 上游发现 | 启动使用的 Chromium 可执行文件 |
 | `endpoint` | attach 时必填 | 已有浏览器调试端点 |
@@ -57,7 +60,7 @@ kind: "package-reference"
 <details>
 <summary>实现细节 — 点击展开</summary>
 
-提供方解析固定版本 npm 包的可执行入口，并使用当前 Node 启动。服务进程之前可能运行临时协议探测进程。[共享运行时](../browser-use-runtime/README.zh.md)负责等待 Agent 初始化、逐 Session 串行执行与清理；[MCP 客户端](../../mcp/mcp-client/README.zh.md)负责传输、发现和结果投影。
+提供方解析固定版本 npm 包的可执行入口，并使用当前 Node 启动。SDK 版本协商可能在服务进程之前运行临时探测进程；按需启动还会运行一次仅获取元数据的进程，其目录在模型请求前注册。[共享运行时](../browser-use-runtime/README.zh.md)负责等待 Agent 初始化、逐 Session 串行执行与清理；[MCP 客户端](../../mcp/mcp-client/README.zh.md)负责结果投影，而运行时通过 SDK stdio 传输复用其公开的工具定义与服务器上下文导出。
 
 只要活动 Session 保持连接，浏览器状态就会跨轮次保留。MCP 服务器在经验证的 Session 当前工作目录中启动；Session 后续改变目录时，服务器保留启动目录。销毁会等待服务器关闭，再释放资源。重新加载后恢复 Session 会创建新的浏览器运行状态；已保存的对话历史不会还原 Cookie 或页面。
 
@@ -98,7 +101,7 @@ kind: "package-reference"
 本集成保留固定版本服务器的浏览器与工具限制。
 
 - 仅支持 Chromium；不可选择 Firefox 或 WebKit。
-- 启动失败或取消会拒绝 Session 创建或恢复，并触发客户端清理。断开的客户端不会重试；修复原因后，创建新 Session，或卸载并恢复已有 Session。
+- 启动失败或取消会拒绝 Session 创建或恢复，并触发客户端清理。使用按需启动时，首次浏览器调用失败只报告错误而不重试；断开或目录漂移的服务进程不会被替换。修复原因后，创建新 Session，或卸载并恢复已有 Session。
 - 连接独占仅在此提供方实例内有效。其他进程与浏览器用户仍可修改相同页面。
 - 共享资源服务器目录可以显示继承的服务器名称，但不会授予对其他 Session 浏览器的访问权限。
 - 取消不会撤销已发送给浏览器的导航、点击或其他操作。

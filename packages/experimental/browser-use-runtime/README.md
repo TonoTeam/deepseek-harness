@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Browser providers use this library to reuse a browser across one Session's turns and close its resources when that Session's runtime is disposed. Operations for one Session run in order, while isolated Sessions can proceed independently. Attachment mode reserves one external browser for a single Session. The library also connects provider-owned MCP servers and discovers their tools before the Session's first model request.
+Browser providers use this library to reuse a browser across one Session's turns and close its resources when that Session's runtime is disposed. Operations for one Session run in order, while isolated Sessions can proceed independently. Attachment mode reserves one external browser for a single Session. The library also connects provider-owned MCP servers and discovers their tools before the Session's first model request. With opt-in `startup: on-demand`, an independent browser's catalogue and instructions arrive before the first model request while its serving process starts only when that Session first uses a browser tool or resource.
 
 ## Table of Contents
 
@@ -31,6 +31,8 @@ Native providers construct `SessionResources` from the package root, supplying r
 
 MCP providers use `mountSessionMcp` from `@deepseek-ai/dsh-experimental-browser-use-runtime/mcp`, supplying their fixed server name, executable, arguments, and ownership policy. The mounting context must provide `workingDirectory`. Acquisition uses the [working-directory service](../../session/working-directory/README.md) to validate or recover the current directory and set the MCP server process's initial directory. Retained servers keep that directory when the Session later selects another. The helper awaits one scoped client startup and discovery attempt within each future Agent's `agent/created` event. Agent creation or resume completes after discovery, before queued input runs; a successful client remains owned by that Session across turns.
 
+`startup: 'on-demand'` is available for launch mode only. The helper then runs one provider-owned metadata connection of `command` with the separate `metadata.args`: initialization and tool listing only, in a neutral temporary directory, with no tool call and no browser profile. That catalogue and its attributed instructions are immutable and registered for every future Agent, so creation and resume still finish before queued input runs. No serving process exists until that Agent first calls a browser tool or resource; the call opens one SDK connection through the Session's queue, concurrent calls share that open, and later turns reuse the connection. Before dispatch, the helper compares the serving process's raw tool name and input schema with the metadata catalogue and fails closed on drift. A serving process that disconnects is not restarted, so browser actions are never replayed. Attachment mode keeps eager startup and rejects on-demand configuration.
+
 A busy attachment skips startup permanently for that live activation while its other work continues. Releasing the attachment does not retry skipped activations; a newly created or resumed Agent can acquire it. Startup failure or cancellation rejects Agent creation or resume and triggers creation rollback, including client cleanup. Reconnection is disabled. Loading or reloading a provider applies only to future Agent activations.
 
 Callers can inspect prompt assembly and scoped tool definitions after awaited Agent creation or resume completes.
@@ -49,7 +51,7 @@ The [resource manager](src/index.ts) keys ownership by live Agent identity and j
 
 Disposed-cause cancellation starts resource cleanup before AgentHandle waits for idle. Cleanup closes resources before waiting for running operations, allowing connection teardown to interrupt upstream APIs without abort support. A failed close rejects disposal and retains ownership. Agent-scoped cleanup prevents a resumed Session with the same durable id from inheriting a previous browser.
 
-The [MCP helper](src/mcp.ts) connects within serial `agent/created`; [AgentLoop](../../core/agent-loop/README.md#understand-the-implementation) holds queued input and owns creation rollback. Prompt assembly reads the initialized catalog. The helper retains the provider registration through resource cleanup and uses the [MCP client](../../mcp/mcp-client/README.md) for transport, schema discovery, result conversion, and durable image admission.
+The [MCP helper](src/mcp.ts) connects within serial `agent/created`; [AgentLoop](../../core/agent-loop/README.md#understand-the-implementation) holds queued input and owns creation rollback. Prompt assembly reads the initialized catalog. The helper retains the provider registration through resource cleanup and uses the [MCP client](../../mcp/mcp-client/README.md) for transport, schema discovery, result conversion, and durable image admission. On-demand startup wraps the same SDK stdio transports and scrubbed environment directly: a transient metadata connection is closed after listing, and each Agent's `SessionResources` entry opens its serving client on first use.
 
 </details>
 
@@ -67,7 +69,7 @@ The [MCP helper](src/mcp.ts) connects within serial `agent/created`; [AgentLoop]
 <a id="model-experience"></a>
 ## Model Experience
 
-Indirectly, through provider-owned browser tools discovered before model request assembly and through [working-directory recovery](../../session/working-directory/README.md); providers and the MCP client own tool descriptions, schemas, results, and image behavior, while the directory service owns directory context.
+Indirectly, through provider-owned browser tools discovered before model request assembly and through [working-directory recovery](../../session/working-directory/README.md); providers and the MCP client own tool descriptions, schemas, results, and image behavior, while the directory service owns directory context. On-demand startup changes only when the serving process starts, not the catalogue the model sees.
 
 #### KV Cache effect
 
@@ -83,6 +85,7 @@ Providers remain responsible for the browser operations they supply.
 - **Attachment scope** — exclusive ownership applies to one resource manager, not separate providers, processes, or external browser clients.
 - **Cancellation** — abort signals and connection closure cannot undo browser actions already delivered. An upstream operation that ignores both can delay cleanup.
 - **Recovery** — a failed close retains ownership; this manager does not retry disposal or restore browser state from the Session log.
+- **On-demand catalogue** — the serving catalogue is compared when a tool is dispatched. DSH does not poll it after startup, so a serving server that changes its tools keeps the metadata definitions and refuses drifted calls.
 - **Shared host runtimes** — a profile installs this package beside the dsh installation, so `@deepseek-ai/dsh-scope` and `@deepseek-ai/dsh-mcp-client` stay peer dependencies. A dependency edge ships a second `dsh-scope` copy whose scope tags host registries cannot read: each Agent's MCP tools would register in the global tool layer and the second Agent's creation would fail.
 
 <a id="dev-note"></a>
