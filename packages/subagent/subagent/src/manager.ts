@@ -40,7 +40,7 @@ import type {
 import { attachStructuredRuntime } from './structured.ts'
 import type { StructuredAttachment } from './structured.ts'
 import type { SubagentDelivery } from './control-types.ts'
-import { ActivationPool, ChildLock, activationAgent, captureLocalResult, observeLocalFailure, requireLocalActivation } from './activation.ts'
+import { ActivationPool, ChildLock, ParentLease, activationAgent, captureLocalResult, observeLocalFailure, requireLocalActivation } from './activation.ts'
 import type { Activation, ActivationResource, LocalActivation } from './activation.ts'
 
 /** Inputs shared by model steering and human prompt delivery. */
@@ -70,6 +70,13 @@ interface MaterializeBase {
   childId: SessionId
   provider: string
   parent: Agent
+  /**
+   * Exact-parent lease acquired by the start or resume operation before its
+   * first await. Ownership transfers to the published Activation; every
+   * pre-publication failure releases it here unless teardown made the child's
+   * stop unconfirmed, and disposal releases it after the settlement notice.
+   */
+  parentLease: ParentLease
   signal: AbortSignal
   delivery?: 'parent' | 'caller' | undefined
 }
@@ -407,6 +414,15 @@ export class SubagentManager {
     // still creating its child. A turn-scoped delegation does not need this,
     // but the service is also callable outside a turn.
     const releaseHold = this.holdOwnership(parent, childId)
+    // The parent lease starts before directory preparation and provider
+    // preparation, and outlives this method through the Activation.
+    let parentLease: ParentLease
+    try {
+      parentLease = new ParentLease(this.ctx.agents.retain(parent))
+    } catch (error: unknown) {
+      releaseHold()
+      throw error
+    }
     try {
       const cwd = await this.resolveDirectory(request, spec.signal)
       const prepared = await this.host.prepareContinuable(spec.provider, {
@@ -439,6 +455,7 @@ export class SubagentManager {
           childId,
           provider: spec.provider,
           parent,
+          parentLease,
           create: {
             cwd,
             seed,
@@ -471,6 +488,9 @@ export class SubagentManager {
       return { ...this.receipt(established), childId, messageId }
     } catch (error: unknown) {
       releaseHold()
+      // Idempotent: materialize's rejection and disposal already release it,
+      // and this covers every failure before an Activation exists.
+      parentLease.release()
       throw error
     }
   }
@@ -485,6 +505,13 @@ export class SubagentManager {
     this.assertAdmitting(parent)
     const pendingId = brandString<SessionId>(randomUUID())
     const releaseHold = this.holdOwnership(parent, pendingId)
+    let parentLease: ParentLease
+    try {
+      parentLease = new ParentLease(this.ctx.agents.retain(parent))
+    } catch (error: unknown) {
+      releaseHold()
+      throw error
+    }
     let activation: Activation | undefined
     try {
       const cwd = await this.resolveDirectory(spec.request, spec.signal)
@@ -493,6 +520,7 @@ export class SubagentManager {
         childId: pendingId,
         provider: spec.provider,
         parent,
+        parentLease,
         signal: spec.signal,
         delivery: spec.delivery,
         start: signal => this.host.startExternal(spec.provider, {
@@ -518,6 +546,9 @@ export class SubagentManager {
       throw error
     } finally {
       releaseHold()
+      // Success keeps the lease on the live Activation; only a failed start
+      // releases it here, and disposal may already have done so.
+      if (activation === undefined || activation.closing !== undefined) parentLease.release()
     }
   }
 
@@ -754,6 +785,9 @@ export class SubagentManager {
       { ...inputs, signal: AbortSignal.any([inputs.signal, controller.signal]) }, lineage, pool, releaseSlot,
     ).catch((error: unknown) => {
       releaseSlot()
+      // Pre-publication failure: no Activation owns the lease yet. Idempotent
+      // when rollbackUnpublished already released it.
+      inputs.parentLease.release()
       if (error instanceof Error && error.name === 'AbortError') this.assertAdmitting(inputs.parent)
       throw error
     }).finally(() => {
@@ -868,7 +902,14 @@ export class SubagentManager {
         void run.result.catch(() => undefined)
         childId = run.id
         try { this.assertChildIdAvailable(childId) } catch (error: unknown) {
-          await run.dispose()
+          try {
+            await run.dispose()
+          } catch (disposeError: unknown) {
+            // The run was accepted but could not be cleaned up; its own
+            // terminal signal is the only remaining proof of stop.
+            inputs.parentLease.deferUntilStopped(run.result)
+            throw disposeError
+          }
           throw error
         }
       } finally {
@@ -931,6 +972,7 @@ export class SubagentManager {
       childId,
       ...resource,
       parent,
+      parentLease: inputs.parentLease,
       delivery: inputs.delivery ?? 'parent',
       result: Promise.withResolvers<SubagentResult>(),
       closing: undefined,
@@ -983,9 +1025,20 @@ export class SubagentManager {
     return this.close(activation, async () => {
       try {
         await (activation.kind === 'local' ? activation.handle.dispose() : activation.run.dispose())
+      } catch (cleanupError: unknown) {
+        // Rejection is not proof the execution stopped. Keep the parent pinned
+        // until the external run's terminal result; a local handle exposes no
+        // independent stop signal, so it stays pinned rather than guessing.
+        activation.parentLease.deferUntilStopped(
+          activation.kind === 'external' ? activation.run.result : undefined,
+        )
+        throw cleanupError
       } finally {
         this.resident.delete(activation.childId)
         activation.releaseSlot()
+        // A no-op while the failed teardown above left stop unconfirmed. All
+        // outer rollback releases share this one lifetime owner.
+        activation.parentLease.release()
         this.releaseOwnership(activation.childId)
         activation.result.reject(error)
       }
@@ -1175,7 +1228,13 @@ export class SubagentManager {
     this.resident.delete(childId)
     activation.releaseSlot()
     const terminal: SubagentResult = failure === undefined ? result : { output: [], stopReason: 'error' }
-    this.notifySettlement(activation, result)
+    // The lease covers cleanup and the parent-result queueing window: release
+    // it only after notifySettlement has handed the result to the parent.
+    try {
+      this.notifySettlement(activation, result)
+    } finally {
+      activation.parentLease.release()
+    }
     this.releaseOwnership(childId)
     activation.observer.settle(terminal)
     if (resultFailure === undefined) activation.result.resolve(result)
@@ -1333,54 +1392,65 @@ export class SubagentManager {
     options: ChildDeliveryOptions,
   ): Promise<MessageId> {
     const query = this.requireSessionQuery()
-    let observation: SessionObservation
+    // Cold resume prepares durable state and materializes a child too, so the
+    // same exact-parent lease starts before the first await.
+    const parentLease = new ParentLease(this.ctx.agents.retain(parent))
     try {
-      observation = await query.observeSession(childId, {
-        signal: options.signal,
-      })
-    } catch (error: unknown) {
-      options.signal.throwIfAborted()
-      throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
-    }
-    using source = observation
-    this.assertAdmitting(parent)
-    this.authorizeLineage(parent, childId, source.header.parentSession)
-    const ownEvents = source.events.slice(source.inheritedEventCount)
-    const descriptor = foldSubagentDescriptor(ownEvents)
-    if (descriptor === undefined || descriptor.mode !== 'continuable') {
-      throw new SubagentError(
-        `subagent "${childId}" has no supported continuation state and cannot be resumed; choose a different target`,
-        'NOT_RESUMABLE',
-      )
-    }
-    let activation: Activation
-    try {
-      const independentlySelected = hasIndependentPresetSelection(ownEvents)
-      const agentPreset = independentlySelected ? source.projections?.values.agentPreset : undefined
-      if (independentlySelected && typeof agentPreset !== 'string') {
-        throw new SubagentError(`subagent "${childId}" has no agent preset projection for restoration`, 'NOT_RESUMABLE')
+      let observation: SessionObservation
+      try {
+        observation = await query.observeSession(childId, {
+          signal: options.signal,
+        })
+      } catch (error: unknown) {
+        options.signal.throwIfAborted()
+        throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
       }
-      activation = await this.materialize({
-        kind: 'local',
-        childId,
-        provider: descriptor.provider,
-        parent,
-        agentOptions: {
-          ...descriptor.agentProvider !== undefined ? { provider: descriptor.agentProvider } : {},
-          ...descriptor.agentModel !== undefined ? { model: descriptor.agentModel } : {},
-          ...descriptor.agentReasoningEffort !== undefined
-            ? { reasoningEffort: ReasoningEffortId(descriptor.agentReasoningEffort) }
-            : {},
-        },
-        composition: { agentPreset: agentPreset ?? undefined, persona: descriptor.persona, toolFilter: descriptor.toolFilter },
-        signal: options.signal,
-      })
+      using source = observation
+      this.assertAdmitting(parent)
+      this.authorizeLineage(parent, childId, source.header.parentSession)
+      const ownEvents = source.events.slice(source.inheritedEventCount)
+      const descriptor = foldSubagentDescriptor(ownEvents)
+      if (descriptor === undefined || descriptor.mode !== 'continuable') {
+        throw new SubagentError(
+          `subagent "${childId}" has no supported continuation state and cannot be resumed; choose a different target`,
+          'NOT_RESUMABLE',
+        )
+      }
+      let activation: Activation
+      try {
+        const independentlySelected = hasIndependentPresetSelection(ownEvents)
+        const agentPreset = independentlySelected ? source.projections?.values.agentPreset : undefined
+        if (independentlySelected && typeof agentPreset !== 'string') {
+          throw new SubagentError(`subagent "${childId}" has no agent preset projection for restoration`, 'NOT_RESUMABLE')
+        }
+        activation = await this.materialize({
+          kind: 'local',
+          childId,
+          provider: descriptor.provider,
+          parent,
+          parentLease,
+          agentOptions: {
+            ...descriptor.agentProvider !== undefined ? { provider: descriptor.agentProvider } : {},
+            ...descriptor.agentModel !== undefined ? { model: descriptor.agentModel } : {},
+            ...descriptor.agentReasoningEffort !== undefined
+              ? { reasoningEffort: ReasoningEffortId(descriptor.agentReasoningEffort) }
+              : {},
+          },
+          composition: { agentPreset: agentPreset ?? undefined, persona: descriptor.persona, toolFilter: descriptor.toolFilter },
+          signal: options.signal,
+        })
+      } catch (error: unknown) {
+        options.signal.throwIfAborted()
+        if (error instanceof SubagentError) throw error
+        throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
+      }
+      return await this.submitMaterialized(activation, content, options, parent)
     } catch (error: unknown) {
-      options.signal.throwIfAborted()
-      if (error instanceof SubagentError) throw error
-      throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
+      // Idempotent after a failed materialization or disposal; this covers
+      // every rejection before an Activation owns the lease.
+      parentLease.release()
+      throw error
     }
-    return await this.submitMaterialized(activation, content, options, parent)
   }
 
   /** Admit a materialized child, commit its creation fact, and release it on failure. */

@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { AgentReclaimingError } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { bindScopeParent, createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
@@ -1654,6 +1654,96 @@ describe('owned job Session lifecycle records', () => {
     } finally {
       append.mockRestore()
       warn.mockRestore()
+    }
+  })
+})
+
+describe('LocalJobRegistry owner retention', () => {
+  it('pins running, stopping, and settled-unread owned records until removal', async () => {
+    const ctx = await harness()
+    try {
+      const owner = await liveAgent(ctx, 'retention-owner')
+      const p = producer({ owner })
+      const id = ctx.jobs.start(p.spec)
+
+      // Running: one exact-owner lease forbids the native atomic seal, and the
+      // idle sweep could not have invoked the producer's cancel.
+      expect(ctx.jobs.get(id, owner.id).status).toBe('running')
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+      expect(p.cancels).toEqual([])
+
+      // Stopping after an explicit kill keeps the same pin; idle reclamation
+      // and user-requested cancellation remain distinct paths.
+      ctx.jobs.kill(id, owner.id, 'user requested')
+      expect(ctx.jobs.get(id, owner.id).status).toBe('stopping')
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+      expect(p.cancels).toEqual(['user requested'])
+
+      // Settled but unread: the record still owns an unread result and remains
+      // pinned even after the model has consumed it.
+      p.settle({ status: 'killed', result: 'unread result' })
+      await tick()
+      expect(ctx.jobs.get(id, owner.id).status).toBe('killed')
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.agents.sealReclaim(owner)).toBeUndefined()
+      expect(p.cancels).toEqual(['user requested'])
+      expect(ctx.jobs.read(id, owner.id).result).toBe('unread result')
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+
+      // Only record removal releases the lease and restores idle eligibility.
+      ctx.jobs.remove(id, owner.id)
+      expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      const ticket = ctx.agents.sealReclaim(owner)
+      expect(ticket).toBeDefined()
+      ticket?.abort()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects a sealed owner before the producer, releases failed starts, and drops owner cleanup records', async () => {
+    const ctx = await harness()
+    try {
+      const owner = await liveAgent(ctx, 'retention-start-owner')
+
+      const sealed = ctx.agents.sealReclaim(owner)
+      if (sealed === undefined) throw new Error('owner should have been sealable')
+      const blocked = producer({ owner })
+      expect(() => ctx.jobs.start(blocked.spec)).toThrow(AgentReclaimingError)
+      expect(() => blocked.job()).toThrow('producer not started')
+      expect(ctx.jobs.list(owner.id)).toEqual([])
+      sealed.abort()
+
+      const boom: JobSpec = {
+        kind: 'bash',
+        label: 'throws during start',
+        owner: owner.id,
+        run: () => { throw new Error('producer start failed') },
+      }
+      expect(() => ctx.jobs.start(boom)).toThrow('producer start failed')
+      expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      expect(ctx.jobs.list(owner.id)).toEqual([])
+
+      let settle!: (outcome: JobOutcome) => void
+      const done = new Promise<JobOutcome>((resolve) => { settle = resolve })
+      const id = ctx.jobs.start({
+        kind: 'bash',
+        label: 'owner cleanup',
+        owner: owner.id,
+        run: () => ({
+          done,
+          cancel: () => { settle({ status: 'killed', detail: 'owner disposed' }) },
+        }),
+      })
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      await disposeAgentScope(owner)
+      expect(ctx.jobs.list(owner.id)).toEqual([])
+      expect(ctx.agents.retention(owner)?.leases).toBe(0)
+      expect(id).toBeTypeOf('string')
+    } finally {
+      await ctx.fiber.dispose()
     }
   })
 })

@@ -2,7 +2,7 @@
  * @module @deepseek-ai/dsh-subagent/activation
  */
 
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentActivityLease, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import { finalAssistantOutput } from './assistant-output.ts'
@@ -11,6 +11,62 @@ import type { ActivationObserver } from './lifecycle.ts'
 import { SubagentError } from './error.ts'
 import type { StructuredAttachment } from './structured.ts'
 import type { SubagentResult, SubagentRun } from './types.ts'
+
+/**
+ * Single lifetime owner for one exact-parent usage lease.
+ *
+ * Ordinary release happens once the activation's settlement notice is queued.
+ * A failed teardown moves the lease to an unconfirmed stop: release requests
+ * from every rollback layer are ignored until the supplied terminal signal
+ * settles, so an unknown backend outcome cannot let idle reclamation reclaim
+ * the parent. Without such a signal the lease stays held rather than guessing.
+ */
+export class ParentLease {
+  private readonly lease: AgentActivityLease
+  private released = false
+  private unknownStop = false
+
+  /**
+   * Take ownership of one exact-parent usage lease.
+   * @param lease - lease acquired from the agent registry.
+   */
+  constructor(lease: AgentActivityLease) {
+    this.lease = lease
+  }
+
+  /**
+   * Release the parent unless an earlier failed teardown left its stop
+   * unconfirmed. Subsequent calls are no-ops.
+   */
+  release(): void {
+    if (this.released || this.unknownStop) return
+    this.released = true
+    this.lease.release()
+  }
+
+  /**
+   * Record that teardown failed and the child may still be running. The lease
+   * remains held until `confirmation` settles; absence of a confirmation means
+   * no observable stop signal, so the lease stays held indefinitely.
+   * @param confirmation - terminal execution signal that proves the child stopped.
+   */
+  deferUntilStopped(confirmation?: Promise<unknown>): void {
+    if (this.released || this.unknownStop) return
+    this.unknownStop = true
+    if (confirmation === undefined) return
+    void confirmation.then(
+      () => { this.confirmStopped() },
+      () => { this.confirmStopped() },
+    )
+  }
+
+  /** Release the held lease after the deferred stop signal arrives. */
+  private confirmStopped(): void {
+    if (this.released) return
+    this.unknownStop = false
+    this.release()
+  }
+}
 
 /** Process-local slots shared through uninterrupted continuable parent links. */
 export class ActivationPool {
@@ -47,6 +103,13 @@ interface ActivationBase {
   /** The durable child this Activation is an epoch of. */
   readonly childId: SessionId
   readonly parent: Agent
+  /**
+   * Exact-parent usage lease acquired before preparation or materialization.
+   * One lease covers startup, execution, cleanup, and settlement notification;
+   * it is released only after the parent result has been queued, and stays
+   * held across an unconfirmed teardown failure.
+   */
+  readonly parentLease: ParentLease
   readonly delivery: 'parent' | 'caller'
   readonly result: PromiseWithResolvers<SubagentResult>
   /** Published synchronously before teardown; subsequent callers share this transaction. */
