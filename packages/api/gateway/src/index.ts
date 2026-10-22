@@ -1458,8 +1458,10 @@ async function *cancellableStream(
  * Keep Host borrows for the actual source iterator lifetime. The wrapper covers
  * cancellation before the first `next()`, where an async generator's body and
  * `finally` never run, while {@link cancellableStream} owns cleanup for started
- * streams. Both paths share one memoized source iterator and never replay the
- * Remote method or call `next()` during unstarted cleanup.
+ * streams. Both paths share one memoized source iterator and one lifecycle: once
+ * a close starts, its cleanup promise owns every later terminal operation, and a
+ * completed close never reopens the wrapper or replays a factory, getter,
+ * method, or source `return()`.
  * @param iteratorFactory - creates the business iterator when the stream starts
  *   or closes early; called at most once per wrapper iterator.
  * @param endpoint - canonical endpoint for cancellation failures.
@@ -1487,43 +1489,84 @@ function ownedStream(
       }
       const generator = cancellableStream(sourceIterator, endpoint, invocation, release)
       const iterator = generator[Symbol.asyncIterator]()
-      let started = false
-      let finished = false
+      // `closing` and `closed` belong to the same terminal owner: `terminal`
+      // settles the one cleanup whether the source was started or never read.
+      let lifecycle: 'unstarted' | 'started' | 'closing' | 'closed' = 'unstarted'
+      let terminal: Promise<void> | undefined
       // A generator cancelled before its first next() has not entered the
       // body, so its own finally cannot run. The wrapper closes the carrier
       // and awaits the real business iterator's cleanup itself; it never calls
       // next() and never replays the method that allocated the iterator.
-      const finishBeforeStart = async (): Promise<void> => {
-        if (started || finished) return
-        finished = true
-        try {
+      const closeUnstarted = (): Promise<void> => {
+        if (terminal !== undefined) return terminal
+        lifecycle = 'closing'
+        const closing = (async (): Promise<void> => {
           try {
-            await invocation.close()
+            try {
+              await invocation.close()
+            } finally {
+              await sourceIterator().return?.()
+            }
           } finally {
-            await sourceIterator().return?.()
+            release()
+            lifecycle = 'closed'
           }
-        } finally {
-          release()
-        }
+        })()
+        // Every later read observes settlement, while this close reports its
+        // own cleanup failure to the caller that started it.
+        terminal = closing.then(() => undefined, () => undefined)
+        return closing
+      }
+      const closeStarted = (operation: Promise<IteratorResult<unknown>>): Promise<IteratorResult<unknown>> => {
+        lifecycle = 'closing'
+        terminal = operation.then(() => undefined, () => undefined)
+        return operation.finally(() => { lifecycle = 'closed' })
+      }
+      const awaitTerminal = async (): Promise<void> => {
+        // The initiating close owns cleanup failure reporting; a terminal read
+        // only waits for the same cleanup before it reports the stream done.
+        await terminal
       }
       return {
         next: async (value?: unknown) => {
-          started = true
-          return iterator.next(value)
+          if (lifecycle === 'closed') return { done: true, value: undefined }
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
+            return { done: true, value: undefined }
+          }
+          lifecycle = 'started'
+          const result = await iterator.next(value)
+          if (result.done === true) {
+            // A concurrent close owns the same cleanup; let it settle first so
+            // its terminal reads cannot bypass an in-flight release.
+            await terminal
+            lifecycle = 'closed'
+          }
+          return result
         },
         return: async (value?: unknown) => {
-          if (!started) {
-            await finishBeforeStart()
+          if (lifecycle === 'closed') return { done: true, value }
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
             return { done: true, value }
           }
-          return iterator.return(value)
+          if (lifecycle === 'unstarted') {
+            await closeUnstarted()
+            return { done: true, value }
+          }
+          return closeStarted(iterator.return(value))
         },
         throw: async (error?: unknown) => {
-          if (!started) {
-            await finishBeforeStart()
+          if (lifecycle === 'closed') throw error
+          if (lifecycle === 'closing') {
+            await awaitTerminal()
             throw error
           }
-          return iterator.throw(error)
+          if (lifecycle === 'unstarted') {
+            await closeUnstarted()
+            throw error
+          }
+          return closeStarted(iterator.throw(error))
         },
       }
     },

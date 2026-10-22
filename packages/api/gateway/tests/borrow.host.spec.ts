@@ -286,6 +286,82 @@ describe('Gateway Host borrowing', () => {
     expect(service.customCalls).toBe(1)
   })
 
+  it.each([
+    { operation: 'return', concurrent: false },
+    { operation: 'throw', concurrent: false },
+    { operation: 'return', concurrent: true },
+  ] as const)('keeps a closed unstarted stream terminal after $operation (next during close: $concurrent)', async ({ operation, concurrent }) => {
+    const { ctx, service } = await setup()
+    let leases = 0
+    const release = vi.fn(() => { leases -= 1 })
+    registerLookup(ctx, 'borrowAgent', 'agent', () => {
+      leases += 1
+      return { value: { id: 'agent-1' }, release }
+    })
+    const sourceCleanup = Promise.withResolvers<undefined>()
+    const returned = vi.fn(async (): Promise<IteratorResult<unknown>> => {
+      await sourceCleanup.promise
+      return { done: true, value: undefined }
+    })
+    // A re-entered wrapper would surface this business item and invoke the read.
+    const next = vi.fn((): Promise<IteratorResult<unknown>> =>
+      Promise.resolve({ done: false, value: 42 }))
+    service.customSource = {
+      [Symbol.asyncIterator]: () => ({ next, return: returned }),
+    }
+    const iterator = (await ctx.typertGateway.stream({
+      peer: ownerPeer(ctx),
+      namespace: 'borrow',
+      method: 'custom',
+      args: { agentId: 'agent-1' },
+    }))[Symbol.asyncIterator]()
+
+    const failure = new Error('terminal close')
+    const closing = operation === 'return'
+      ? iterator.return?.(undefined)
+      : expect(iterator.throw?.(failure)).rejects.toBe(failure)
+    await vi.waitFor(() => { expect(returned).toHaveBeenCalledOnce() })
+    expect(next).not.toHaveBeenCalled()
+    expect(leases).toBe(1)
+    expect(release).not.toHaveBeenCalled()
+
+    let pendingNext: Promise<IteratorResult<unknown>> | undefined
+    let repeated: Promise<IteratorResult<unknown>> | undefined
+    if (concurrent) {
+      let settled = false
+      pendingNext = iterator.next().then((result) => { settled = true; return result })
+      let repeatedSettled = false
+      repeated = iterator.return?.(undefined)
+      void repeated?.then(() => { repeatedSettled = true })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+      // A repeated close joins the pending cleanup instead of finishing first
+      // or starting a second one.
+      expect(repeatedSettled).toBe(false)
+    }
+    sourceCleanup.resolve(undefined)
+    await closing
+    if (pendingNext !== undefined) {
+      await expect(pendingNext).resolves.toEqual({ done: true, value: undefined })
+    }
+    if (repeated !== undefined) {
+      await expect(repeated).resolves.toEqual({ done: true, value: undefined })
+    }
+    // The lease covered the real source cleanup and ends only after it.
+    expect(next).not.toHaveBeenCalled()
+    expect(leases).toBe(0)
+    expect(release).toHaveBeenCalledOnce()
+
+    // Every read after the terminal cleanup is done: no wrapper re-entry,
+    // factory replay, or business next.
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined })
+    await expect(iterator.return?.(undefined)).resolves.toEqual({ done: true, value: undefined })
+    expect(next).not.toHaveBeenCalled()
+    expect(returned).toHaveBeenCalledOnce()
+    expect(service.customCalls).toBe(1)
+    expect(leases).toBe(0)
+  })
+
   it('releases the borrow when a source getter throws during stream validation', async () => {
     const { ctx, service } = await setup()
     const release = vi.fn()
