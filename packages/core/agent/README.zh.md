@@ -31,6 +31,8 @@ kind: "package-reference"
 
 `ctx.agents.create()` 在一个身份下构建全新 agent 与会话；`ctx.agents.resume()` 加载持久化会话并在此基础上重建 agent。两者都委托给已注册工厂，并返回 `AgentHandle`——唯一能拆除该 agent 的对象。在任一操作的 options 中设置 `parentAgent`，可使结果成为运行时子级；省略它则得到运行时根级。`get(id)`、`list()` 与 `roots()` 用于查找实时 agent；`isOwnedBy(id, parent)` 用于检验这项确切的实时所有权关系。
 
+`ctx.agents.retain(agent)` 为借用一个 Agent 的工作获取一个同步的精确实例使用租约；已封口（sealed）或已隔离（quarantined）身份会在调用方产生副作用之前以 `AgentReclaimingError` 拒绝，释放操作幂等。`retention(agent)` 读取权威的租约／状态快照，`assertAcceptsWork(agent)` 则通过一份不保留任何已退役 Agent 的弱引用实例准入记录，拒绝到达已 detach 或同 id 已被替换实例的工作。`sealReclaim(agent)` 仅在状态为 open 且租约数为零时原子地封口准入；其 ticket 要么在 abort 时恢复 open 准入，要么在 commit 后不可逆。句柄上可选的 `reclaim` 能力仅由原生循环提供：`idleSince()` 在维护、待处理输入、租约与尚未完成的发布期间都不报告静止；`tryReclaim(check, { signal, timeoutMs })` 要求有一次真实参与的持久化 flush。仅内存会话以 `busy`/`persistence` 拒绝；flush 失败会解封同一个 Agent，而未知的拆除结果会在隔离身份后抛出 `AgentReclaimTeardownError`，因此拥有者不得自动恢复或替换它。
+
 ```text
 const handle = await ctx.agents.create({
   sessionId,

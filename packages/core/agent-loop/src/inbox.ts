@@ -76,6 +76,10 @@ export class ReactLoopInbox implements InboxContract {
     private readonly projections: SessionProjectionRegistry,
     private readonly session: Session,
     private readonly dispatch: AgentEventDispatch,
+    /** Admission gate for externally writable splices; absent for direct test construction. */
+    private readonly admit: () => void = () => {},
+    /** Driver activity notice; every committed mutation refreshes quiescence. */
+    private readonly noteMutation: () => void = () => {},
   ) {}
 
   /** Prompts awaiting individual turns. */
@@ -96,8 +100,10 @@ export class ReactLoopInbox implements InboxContract {
 
   /** Durably cancel all pending input, clearing next-step before next-turn. */
   clear(): void {
-    this.splice('next-step', 0, this.nextStep.length, [])
-    this.splice('next-turn', 0, this.nextTurn.length, [])
+    // Driver-owned cancellation removes work; it must stay callable during
+    // owner teardown after admission sealed.
+    this.mutate('next-step', 0, this.nextStep.length, [], true)
+    this.mutate('next-turn', 0, this.nextTurn.length, [], true)
   }
 
   /**
@@ -170,6 +176,7 @@ export class ReactLoopInbox implements InboxContract {
     deleteCount: number,
     inserted: UserMessage[],
   ): UserMessage[] {
+    this.admit()
     return this.mutate(target, start, deleteCount, inserted, true)
   }
 
@@ -194,7 +201,7 @@ export class ReactLoopInbox implements InboxContract {
     return state
   }
 
-  /** Commit one normalized mutation and publish its live events. */
+  /** Commit one normalized driver-owned mutation and publish its live events. */
   private mutate(
     target: InboxTarget,
     start: number,
@@ -233,6 +240,7 @@ export class ReactLoopInbox implements InboxContract {
     }
     const removed = inbox.slice(actualStart, actualStart + actualDeleteCount)
     const event = this.session.append('agent/inbox/spliced', splice)
+    this.noteMutation()
     if (discardRemoved) {
       for (const message of removed) this.dispatch.emit('agent/inbox/discarded', { message })
     }

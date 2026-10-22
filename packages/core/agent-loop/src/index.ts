@@ -16,12 +16,15 @@ import type {
   AgentFactory,
   AgentHandle,
   AgentOptions,
+  AgentReclaimCapability,
+  AgentReclaimOptions,
   AgentSetup,
   CreateAgentOptions,
   ResumeAgentOptions,
   SessionStartSource,
   TurnBoundaryProjection,
 } from '@deepseek-ai/dsh-agent'
+import { AgentReclaimTeardownError } from '@deepseek-ai/dsh-agent'
 import { errorChain, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { interruptedTurnClosers, SessionLogOffset, SessionPreparation, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
@@ -643,6 +646,97 @@ export class AgentLoop extends Service implements AgentFactory {
       if (machine === undefined) throw new Error(`agent "${id}" lifecycle did not construct its driver`)
       const agent = machine
       assertLive()
+      const reclaim: AgentReclaimCapability = {
+        idleSince: () => agent.idleSince(),
+        tryReclaim: async (check: (signal: AbortSignal) => Promise<boolean>, options?: AgentReclaimOptions) => {
+          if (agent.idleSince() === undefined) return { kind: 'busy', reason: 'active' }
+          const ticket = loopCtx.agents.sealReclaim(agent)
+          if (ticket === undefined) return { kind: 'busy', reason: 'leases' }
+          // Every bound converges on one halt: owner abort, seal abort, or
+          // timeout. A hung proof can therefore never hold admission sealed.
+          const halt = new AbortController()
+          const unlink: Array<() => void> = []
+          const isHalted = (): boolean => halt.signal.aborted
+          const follow = (signal: AbortSignal | undefined): void => {
+            if (signal === undefined) return
+            if (signal.aborted) {
+              halt.abort()
+              return
+            }
+            const onAbort = (): void => { halt.abort() }
+            signal.addEventListener('abort', onAbort, { once: true })
+            unlink.push(() => { signal.removeEventListener('abort', onAbort) })
+          }
+          follow(ticket.signal)
+          follow(options?.signal)
+          const timer = options?.timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => { halt.abort() }, options.timeoutMs)
+          if (isHalted()) {
+            ticket.abort()
+            return { kind: 'busy', reason: 'background' }
+          }
+          const halted = new Promise<false>((resolve) => {
+            if (isHalted()) {
+              resolve(false)
+              return
+            }
+            halt.signal.addEventListener('abort', () => { resolve(false) }, { once: true })
+          })
+          try {
+            const proof = Promise.resolve().then(() => check(ticket.signal))
+            // A proof that loses the race may still reject; observe it without
+            // letting that late rejection escape as unhandled.
+            void proof.catch(() => {})
+            if (!(await Promise.race([proof, halted]))) {
+              ticket.abort()
+              return {
+                kind: 'busy',
+                reason: loopCtx.agents.retention(agent) === undefined ? 'active' : 'background',
+              }
+            }
+            if (loopCtx.agents.retention(agent) === undefined) {
+              // Owner teardown raced the proof and already removed this lifecycle.
+              ticket.abort()
+              return { kind: 'busy', reason: 'active' }
+            }
+            // A false result means no durability listener participated: a
+            // memory-only session has no recoverable point, so keep the Agent.
+            if (!(await loopCtx.sessions.flush(session))) {
+              ticket.abort()
+              return { kind: 'busy', reason: 'persistence' }
+            }
+            // The owner may have backed out while the flush was in flight.
+            if (isHalted()) {
+              ticket.abort()
+              return {
+                kind: 'busy',
+                reason: loopCtx.agents.retention(agent) === undefined ? 'active' : 'background',
+              }
+            }
+            ticket.commit()
+          } catch (error: unknown) {
+            // Guard and flush failures are reversible: restore the same Agent.
+            ticket.abort()
+            // An owner teardown that raced this seal already decided the
+            // lifecycle; its later close failure is not a reclaim alarm.
+            if (loopCtx.agents.retention(agent) === undefined) return { kind: 'busy', reason: 'active' }
+            throw error
+          } finally {
+            if (timer !== undefined) clearTimeout(timer)
+            for (const unlinkSignal of unlink) unlinkSignal()
+          }
+          // The seal is irreversible from here: an unknown teardown outcome
+          // quarantines the identity instead of silently cold-replacing it.
+          try {
+            await dispose()
+            return { kind: 'reclaimed' }
+          } catch (error: unknown) {
+            loopCtx.agents.quarantine(agent)
+            throw new AgentReclaimTeardownError(agent.id, error)
+          }
+        },
+      }
 
       return {
         agent,
@@ -659,7 +753,8 @@ export class AgentLoop extends Service implements AgentFactory {
             assertLive()
             await loopCtx.agents.announce(agent, source, abort.signal)
             assertLive()
-            return { agent, dispose }
+            agent.markPublished()
+            return { agent, dispose, reclaim }
           } finally {
             publication.resolve()
             publication = undefined
