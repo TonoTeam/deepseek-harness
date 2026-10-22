@@ -187,9 +187,6 @@ export class ReactLoopAgent implements Agent {
   }
 
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
-    // Same-tick admission gate: a seal before this call rejects here, and a
-    // seal after it cannot observe this work as absent because insertion and
-    // wake are synchronous.
     this.loopCtx.agents.assertAcceptsWork(this)
     // Waking input cannot join an aborted activity, so it starts the next turn.
     // Captured before the insertion so a reentrant cancel from a splice observer cannot reclassify it.

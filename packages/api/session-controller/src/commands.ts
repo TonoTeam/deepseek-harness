@@ -440,9 +440,6 @@ export class SessionCommandController {
       }
     }
     try {
-      // The cold restore yields before the mutation; retaining the exact Agent
-      // keeps a concurrent idle sweep from sealing it in that window. Only the
-      // acquisition retries; this mutation itself runs at most once.
       return await this.agents.withRetainedAgent(
         request.sessionId,
         agent => Promise.resolve(this.mutateQueue(agent, request)),

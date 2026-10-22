@@ -196,8 +196,6 @@ export class SessionController extends TypertRemoteService {
       if ('error' in result) throw result.error
       return result.agent
     }, async (sessionId) => {
-      // The HTTP upload bypasses the Gateway, so this optional borrower is its
-      // exact lease for the real storage stream.
       const acquired = await this.agents.acquireRetained(sessionId)
       return { value: acquired.agent, release: () => { acquired.lease.release() } }
     }), 'session-controller: file-upload Agent resolver')
@@ -266,8 +264,6 @@ export class SessionController extends TypertRemoteService {
         this.ctx.emit('api-session/error', sessionId, result.error.message)
         return undefined
       }
-      // Acquire before any later timer tick: a cold follow keeps its promoted
-      // Agent resident until the generator's own cleanup releases this lease.
       return this.agents.retainLive(sessionId)
     })().catch((error: unknown) => {
       this.ctx.logger.error(`session-controller: background activation for "${sessionId}" failed: ${errorChain(error)}`)
@@ -352,8 +348,6 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('selectModel')
   selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue> {
-    // Model resolution and any asynchronous provider work stay pinned to the
-    // exact Agent; the Gateway borrow covers other packages' Remote methods.
     return this.agents.withRetainedAgent(request.sessionId, () => this.commands.selectModel(request))
   }
 
@@ -474,8 +468,6 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('rename')
   rename(request: SessionRenameRequest): Promise<SessionRenameValue> {
-    // Title validation and the durable append stay pinned to the exact Agent;
-    // a seal that wins the acquisition race retries only the acquisition.
     return this.agents.withRetainedAgent(request.sessionId, () => this.commands.rename(request))
   }
 

@@ -214,9 +214,6 @@ export class SessionHistoryController {
     let followerClosed = false
     let promotion: Promise<AgentActivityLease | undefined> | undefined
     let promotionLease: AgentActivityLease | undefined
-    // Cold follow promotes after its snapshot without blocking event delivery.
-    // The resulting exact-Agent lease belongs to this generator, even when the
-    // caller closes before activation finishes.
     const adoptPromotion = (lease: AgentActivityLease | undefined): void => {
       if (lease === undefined) return
       if (followerClosed) lease.release()
@@ -289,8 +286,6 @@ export class SessionHistoryController {
       disposeCreated()
       disposeEvent()
       disposeAssistantStream?.()
-      // A promotion that already finished transfers its lease here; a later
-      // settlement releases through adoptPromotion.
       promotionLease?.release()
       promotionLease = undefined
     }

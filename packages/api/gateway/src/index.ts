@@ -482,9 +482,6 @@ export class TypertGatewayService extends Service implements TypertGateway {
     }
     let iteratorFactory: () => SourceIterator
     try {
-      // Validation reads the protocol getters the iteration will use; a
-      // throwing getter after the method allocated its result still unwinds
-      // the invocation and its borrows exactly once.
       iteratorFactory = sourceIteratorFactory(source, prepared.endpoint)
     } catch (error) {
       try {
@@ -494,8 +491,6 @@ export class TypertGatewayService extends Service implements TypertGateway {
       }
       throw error
     }
-    // The returned async iterable keeps every borrow until the source's
-    // actual iterator cleanup completes, including a never-started iterator.
     return ownedStream(iteratorFactory, prepared.endpoint, prepared.invocation, prepared.releaseBorrows)
   }
 
@@ -835,10 +830,6 @@ export class TypertGatewayService extends Service implements TypertGateway {
         })
       }
     }
-    // Borrowed Host objects are acquired only after access is decided, and
-    // they unwind in reverse when any later resolution fails. Parameters are
-    // resolved in declaration order so a first failure cannot leave a later
-    // Promise.all acquisition holding an unowned lease.
     const borrows: TypertBorrowedValue<unknown>[] = []
     let released = false
     const releaseBorrows = (): void => {
@@ -848,8 +839,6 @@ export class TypertGatewayService extends Service implements TypertGateway {
         try {
           borrows[index]?.release()
         } catch (error: unknown) {
-          // Borrow releases are synchronous and must not throw; a provider
-          // that violates that contract must not mask the invocation outcome.
           this.ctx.logger.error(`api-gateway: Host borrow release failed: ${String(error)}`)
         }
       }
@@ -1147,8 +1136,6 @@ export class TypertGatewayService extends Service implements TypertGateway {
     }
     let resolved: unknown
     try {
-      // Borrowing wins over plain resolution: the lookup owner retains the
-      // exact Host object and releases it only after invocation cleanup.
       if (provider.borrow !== undefined) {
         const borrowed = await provider.borrow(value)
         borrows.push(borrowed)
@@ -1413,8 +1400,6 @@ async function *cancellableStream(
   }
   signal.addEventListener('abort', onAbort, { once: true })
   try {
-    // The owning wrapper memoizes creation, so this is the stream's one
-    // business iterator; a throwing factory still unwinds the borrows.
     iterator = sourceIterator()
     while (true) {
       if (signal.aborted) throw streamAbortFailure(endpoint, signal.reason)
@@ -1512,8 +1497,6 @@ function ownedStream(
             lifecycle = 'closed'
           }
         })()
-        // Every later read observes settlement, while this close reports its
-        // own cleanup failure to the caller that started it.
         terminal = closing.then(() => undefined, () => undefined)
         return closing
       }

@@ -231,10 +231,6 @@ export class ApiSessionAgentController {
    * @param idleEviction - opt-in idle policy; omitted keeps reclamation disabled.
    */
   constructor(private readonly ctx: Context, idleEviction?: ApiIdleEvictionConfig) {
-    // Every async Remote path that resolves an Agent, Session, or Agent
-    // Context goes through one borrower: acquire the exact usage lease first,
-    // then hand out the value. The Gateway releases it after the invocation's
-    // actual business lifetime.
     ctx.typert.lookups.configure('agent', async (sessionId: SessionId) => {
       const found = await this.resolveAgent(sessionId)
       if ('error' in found) throw found.error
@@ -281,12 +277,7 @@ export class ApiSessionAgentController {
   ): Promise<ApiSessionAgentResult> {
     const quarantine = this.quarantined.get(sessionId)
     if (quarantine !== undefined) return { error: this.quarantineError(sessionId) }
-    // A retiring identity rejects new work until its owner teardown settles.
-    // This wait precedes acquisition, so no prompt/upload side effect is
-    // replayed; only the resolve/retain acquisition below is retried.
     await this.waitRetiring(sessionId)
-    // A teardown that settled while this request waited may have quarantined
-    // the identity; it must not be cold-replaced.
     if (this.quarantined.has(sessionId)) return { error: this.quarantineError(sessionId) }
     const live = this.liveAgent(sessionId)
     if (live !== undefined) return live
@@ -720,8 +711,6 @@ export class ApiSessionAgentController {
   }
 
   private async waitRetiring(sessionId: SessionId): Promise<void> {
-    // Retirement completion deletes its own record; the loop handles a second
-    // seal admitted immediately after the first one settles.
     for (;;) {
       const retiring = this.retiring.get(sessionId)
       if (retiring === undefined) return
@@ -753,8 +742,6 @@ export class ApiSessionAgentController {
       try {
         return { agent: found.agent, lease: this.ctx.agents.retain(found.agent) }
       } catch (error: unknown) {
-        // Sealed or replaced between resolution and retention: wait for the
-        // owner teardown, then retry acquisition only.
         if (!(error instanceof AgentReclaimingError)) throw error
         await this.waitRetiring(sessionId)
       }
@@ -835,10 +822,7 @@ export class ApiSessionAgentController {
       // whose check keeps reporting activity must not consume the same prefix
       // of the map on every sweep.
       let index = this.sweepCursor % total
-      // Kept behind a call so a teardown racing this sweep is observable
-      // without the compiler proving the flag constant for the whole loop.
-      const shuttingDown = (): boolean => this.disposed
-      for (let visited = 0; visited < total && !shuttingDown() && examined < policy.maxPerSweep; visited += 1) {
+      for (let visited = 0; visited < total && !this.shutdown.signal.aborted && examined < policy.maxPerSweep; visited += 1) {
         const entry = entries[index]
         index = (index + 1) % total
         if (entry === undefined) continue
@@ -846,9 +830,6 @@ export class ApiSessionAgentController {
         if (this.handles.get(sessionId) !== handle) continue
         const reclaim = handle.reclaim
         if (reclaim === undefined) continue
-        // Blank Sessions and Sessions without one fully persisted turn have no
-        // durable recovery point yet. Reclaiming them would discard the only
-        // artifact their identity has; defer until a complete turn exists.
         if (!this.hasCompletedTurn(handle.agent.session)) continue
         const idleSince = reclaim.idleSince()
         if (idleSince === undefined || now - idleSince < policy.idleTtlMs) continue
@@ -870,12 +851,8 @@ export class ApiSessionAgentController {
     const retiring = new Promise<void>((resolve) => { settle = resolve })
     this.retiring.set(sessionId, retiring)
     try {
-      // The check is read-only: an error or unknown family fails closed by
-      // leaving the Agent resident instead of asking any owner to stop work.
       const outcome = await reclaim.tryReclaim(async (signal) => {
         signal.throwIfAborted()
-        // Re-check inside the seal: a blank or unfinished Session has no
-        // complete persisted turn to resume from yet.
         if (!this.hasCompletedTurn(handle.agent.session)) return false
         const activity = await this.ctx.waterfall(
           'workspace/session-activity', { sessionId }, () => Promise.resolve([]),
@@ -883,8 +860,6 @@ export class ApiSessionAgentController {
         signal.throwIfAborted()
         return activity.length === 0
       }, {
-        // Shutdown and the policy bound keep a hung proof from sealing the
-        // identity indefinitely; expiry restores the same live Agent.
         signal: this.shutdown.signal,
         timeoutMs: this.policy?.reclaimTimeoutMs ?? DEFAULT_API_IDLE_EVICTION.reclaimTimeoutMs,
       })
@@ -894,8 +869,6 @@ export class ApiSessionAgentController {
       }
     } catch (error: unknown) {
       if (error instanceof AgentReclaimTeardownError) {
-        // The identity's teardown outcome is unknown. Keep it unavailable
-        // rather than silently cold-replacing the Session on the next request.
         this.quarantined.set(sessionId, error)
         this.ctx.logger.error(`session-controller: quarantine after unknown teardown for "${sessionId}": ${error.message}`)
       } else {
@@ -915,8 +888,6 @@ export class ApiSessionAgentController {
       clearTimeout(this.idleTimer)
       this.idleTimer = undefined
     }
-    // Aborting restores admission for any check still waiting; the sweep loop
-    // then observes the disposed flag and stops.
     this.shutdown.abort()
     this.handles.clear()
     this.retiring.clear()

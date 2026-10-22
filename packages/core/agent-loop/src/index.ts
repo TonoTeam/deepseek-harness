@@ -701,23 +701,18 @@ export class AgentLoop extends Service implements AgentFactory {
               return { kind: 'busy', reason: liveReason() }
             }
             if (loopCtx.agents.retention(agent) === undefined) {
-              // Owner teardown raced the proof and already removed this lifecycle.
               ticket.abort()
               return { kind: 'busy', reason: 'active' }
             }
             const flushed = await raceHalt(loopCtx.sessions.flush(session))
             if (flushed === HALTED) {
-              // A late flush settles without committing this seal.
               ticket.abort()
               return { kind: 'busy', reason: liveReason() }
             }
-            // A false result means no durability listener participated: a
-            // memory-only session has no recoverable point, so keep the Agent.
             if (!flushed) {
               ticket.abort()
               return { kind: 'busy', reason: 'persistence' }
             }
-            // The owner may have backed out while the flush was in flight.
             if (isHalted()) {
               ticket.abort()
               return { kind: 'busy', reason: liveReason() }

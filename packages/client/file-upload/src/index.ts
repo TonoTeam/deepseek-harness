@@ -147,8 +147,6 @@ export class FileUploads extends TypertRemoteService {
         ...(request.name === undefined ? {} : { name: request.name }),
       }))
     } finally {
-      // The HTTP route has no Gateway lifetime: the exact lease acquired for
-      // this upload ends only after storage consumed the stream or failed.
       borrowed?.release()
     }
   }
@@ -223,10 +221,6 @@ export class FileUploads extends TypertRemoteService {
         { sessionId: agent.id },
       )
     }
-    // The receipt is process-local and keyed by the exact Session object, so
-    // the owner stays pinned until prompt admission consumes it or a queue or
-    // history observation retires it. This keeps a long wait before submission
-    // from reclaiming the Agent and dropping an unsubmitted receipt.
     const lease = this.ctx.agents.retain(agent)
     let staged = this.stagedFiles.get(agent.session)
     if (staged === undefined) {
