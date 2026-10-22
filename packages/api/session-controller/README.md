@@ -62,7 +62,7 @@ During uninterrupted following, transcript and steering echoes stay in Chat thro
 
 The user-invocable `skills/list` metadata includes the winning provider’s optional instruction-file `path`. The composer can preview that file without loading every skill body or activating a cold Agent.
 
-Fork copies the exact inclusive event prefix selected by `atSeq`, including a cut inside an open turn. The child records its inherited marker before synthetic fork results and closing events. Omitting `atSeq` selects the latest completed turn and its standalone tail, stopping before the next turn or queued input; a nonexistent event is rejected. The chat action selects a completed turn. A forked child is a creator-owned ordinary Agent: its complete handle joins the same idle reclamation policy, so an idle fork is reclaimed and later cold-resumes from its durable prefix.
+Fork copies the exact inclusive event prefix selected by `atSeq`, including a cut inside an open turn. The child records its inherited marker before synthetic fork results and closing events. Omitting `atSeq` selects the latest completed turn and its standalone tail, stopping before the next turn or queued input; a nonexistent event is rejected. The chat action selects a completed turn. A forked child is a creator-owned ordinary Agent: its complete handle joins the same idle reclamation policy, so an idle fork is reclaimed and later cold-resumes from its durable prefix. The creator lease covers the child from publication through post-create workspace attachment and releases on success or failure, leaving the tracked handle reclaimable either way.
 
 A resume blocked by an existing write handle returns `session/writer-held` with the Session id; other resume failures retain `gateway/internal`.
 

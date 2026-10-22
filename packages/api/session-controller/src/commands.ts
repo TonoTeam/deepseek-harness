@@ -32,6 +32,7 @@ import {
   apiSessionSubagentOwnershipError,
   hasApiSessionSubagentOwner,
   inspectApiSession,
+  type ApiForkedAgent,
   type ApiSessionCreated,
 } from './agent.ts'
 import type {
@@ -271,9 +272,10 @@ export class SessionCommandController {
     }
     const childId = brandString<SessionId>(`session-${randomUUID()}`)
     const composition = await this.agents.composeAgent(this.agents.presetForObservation(source))
+    let forked: ApiForkedAgent
     try {
       const { provider, model } = this.ctx.agentDefaultModel.currentSelection()
-      await this.agents.createForkedAgent({
+      forked = await this.agents.createForkedAgent({
         sessionId: childId,
         seed,
         inheritedEventCount: SessionLogOffset(boundary + 1),
@@ -295,18 +297,22 @@ export class SessionCommandController {
         {},
       )
     }
-    if (workspace !== undefined) {
-      try {
-        await workspace.attachSession(childId)
-      } catch (error) {
-        throw new RemoteError(
-          'session/workspace-attach-failed',
-          `session "${childId}" was forked but could not attach to workspace "${workspace.id}": ${String(error)}`,
-          { sessionId: childId, workspaceId: workspace.id },
-        )
+    try {
+      if (workspace !== undefined) {
+        try {
+          await workspace.attachSession(forked.agent.id)
+        } catch (error) {
+          throw new RemoteError(
+            'session/workspace-attach-failed',
+            `session "${forked.agent.id}" was forked but could not attach to workspace "${workspace.id}": ${String(error)}`,
+            { sessionId: forked.agent.id, workspaceId: workspace.id },
+          )
+        }
       }
+      return { sessionId: forked.agent.id }
+    } finally {
+      forked.release()
     }
-    return { sessionId: childId }
   }
 
   /**

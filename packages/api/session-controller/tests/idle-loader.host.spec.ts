@@ -13,6 +13,7 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import * as AttachmentLocal from '@deepseek-ai/dsh-attachment-local'
 import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
@@ -159,4 +160,85 @@ describe('idle eviction through Loader composition', () => {
     for await (const chunk of ctx.attachments.readFileStream(attachment)) chunks.push(chunk)
     expect(Buffer.concat(chunks).toString('utf8')).toBe('fork attachment')
   }, 20_000)
+
+  it.each(['success', 'failure'] as const)(
+    'keeps a forked child leased through pending workspace attachment (%s) and cold-resumes after release',
+    async (attachOutcome) => {
+      const { ctx, root, fixture } = await boot()
+      const source = await fixture.controller.createSession({ cwd: join(root, 'workspace'), reusable: () => true })
+      source.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'source task' }], source: { kind: 'user' } }))
+      await source.agent.whenIdle()
+      await ctx.sessions.flush(source.agent.session)
+      const attachment = await ctx.attachments.saveFile({ data: new TextEncoder().encode('fork attachment'), name: 'note.txt' })
+
+      let enterAttach!: () => void
+      const attachEntered = new Promise<void>((resolve) => { enterAttach = resolve })
+      let settleAttach!: (error?: Error) => void
+      const attachGate = new Promise<void>((resolve, reject) => {
+        settleAttach = (error) => { if (error === undefined) resolve(); else reject(error) }
+      })
+      let childId: SessionId | undefined
+      Object.assign(ctx.workspaceRegistry, {
+        list: () => [{
+          id: 'review-workspace',
+          sessionIds: [source.agent.id],
+          attachSession: async (sessionId: SessionId) => {
+            childId = sessionId
+            enterAttach()
+            await attachGate
+          },
+        }],
+      })
+
+      // Match the real Loader failure window: the fork request is still pending
+      // while workspace attachment blocks.
+      const pending = fixture.commands.fork({ sessionId: source.agent.id })
+      const settlement = pending.then(
+        value => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      )
+      await attachEntered
+      if (childId === undefined) throw new Error('fork did not reach workspace attachment')
+      const forkId = childId
+      const child = ctx.agents.get(forkId)
+      if (child === undefined) throw new Error('fork did not publish the child Agent')
+      expect(ctx.agents.retention(child)?.leases).toBe(1)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      await fixture.controller.sweepIdleAgents()
+      expect(ctx.agents.get(forkId)).toBe(child)
+      expect(ctx.agents.retention(child)?.leases).toBe(1)
+      await ctx.sessions.flush(child.session)
+      const forkFile = (await jsonlFiles(join(root, 'logs'))).find(file => file.includes(forkId))
+      if (forkFile === undefined) throw new Error('fork JSONL log was not written')
+      const prefix = await readFile(forkFile)
+
+      settleAttach(attachOutcome === 'failure' ? new Error('workspace attach failed') : undefined)
+      const result = await settlement
+      if (attachOutcome === 'failure') {
+        expect(result).toMatchObject({ ok: false, error: { code: 'session/workspace-attach-failed' } })
+      } else {
+        expect(result).toEqual({ ok: true, value: { sessionId: forkId } })
+      }
+      // The finally release drops the lease on both outcomes; the tracked handle
+      // stays reclaimable.
+      expect(ctx.agents.retention(child)).toMatchObject({ leases: 0, state: 'open' })
+      await new Promise(resolve => setTimeout(resolve, 5))
+      await fixture.controller.sweepIdleAgents()
+      expect(ctx.agents.get(forkId)).toBeUndefined()
+
+      const resumed = await fixture.controller.resolveAgent(forkId)
+      if ('error' in resumed) throw new Error('cold resume of the forked Session failed')
+      expect(resumed.agent.id).toBe(forkId)
+      resumed.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'resumed task' }], source: { kind: 'user' } }))
+      await resumed.agent.whenIdle()
+      await ctx.sessions.flush(resumed.agent.session)
+      const grown = await readFile(forkFile)
+      expect(grown.subarray(0, prefix.length).equals(prefix)).toBe(true)
+      expect(grown.length).toBeGreaterThan(prefix.length)
+      const chunks: Uint8Array[] = []
+      for await (const chunk of ctx.attachments.readFileStream(attachment)) chunks.push(chunk)
+      expect(Buffer.concat(chunks).toString('utf8')).toBe('fork attachment')
+    },
+    20_000,
+  )
 })

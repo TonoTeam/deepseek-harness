@@ -86,6 +86,14 @@ export interface ApiSessionCreated {
   readonly agentPreset: string | undefined
 }
 
+/** Published forked Agent plus the creator-held lease for its post-create lifetime. */
+export interface ApiForkedAgent {
+  /** Published child Agent. */
+  readonly agent: Agent
+  /** Release the creator-held usage lease; idempotent, and the tracked handle stays reclaimable afterwards. */
+  readonly release: () => void
+}
+
 /** Resolved preset and pre-publication Agent setup for one create or resume. */
 interface ApiSessionComposition {
   readonly agentPreset?: string
@@ -652,14 +660,19 @@ export class ApiSessionAgentController {
    * Create one forked child and retain its full creator-owned handle.
    * Fork composes its seeded child directly instead of using the ordinary
    * create/resume claim path; this method adds the returned handle to the same
-   * idle policy without a second create or resume.
+   * idle policy without a second create or resume. The exact child keeps one
+   * creator usage lease from publication through the caller's post-create
+   * work, so quiescence cannot reclaim it while that work is pending.
    * @param options - complete seeded creation options for the child.
-   * @returns the published forked Agent.
+   * @returns the published forked Agent and its creator-held lease.
    */
-  async createForkedAgent(options: CreateAgentOptions): Promise<Agent> {
+  async createForkedAgent(options: CreateAgentOptions): Promise<ApiForkedAgent> {
     const handle = await this.ctx.agents.create(options)
     this.track(handle)
-    return handle.agent
+    // Acquire immediately after publication; a failure here keeps the handle
+    // tracked so a later sweep can reclaim it.
+    const lease = this.ctx.agents.retain(handle.agent)
+    return { agent: handle.agent, release: () => { lease.release() } }
   }
 
   private async createAgent(sessionId: SessionId, cwd: string, composition: ApiSessionComposition): Promise<Agent> {
