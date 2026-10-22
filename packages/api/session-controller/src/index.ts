@@ -474,7 +474,9 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('rename')
   rename(request: SessionRenameRequest): Promise<SessionRenameValue> {
-    return this.commands.rename(request)
+    // Title validation and the durable append stay pinned to the exact Agent;
+    // a seal that wins the acquisition race retries only the acquisition.
+    return this.agents.withRetainedAgent(request.sessionId, () => this.commands.rename(request))
   }
 
   /**

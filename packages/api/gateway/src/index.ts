@@ -480,22 +480,23 @@ export class TypertGatewayService extends Service implements TypertGateway {
       if (prepared.invocation.signal.aborted) throw remoteCancelled(prepared.endpoint, error)
       throw error
     }
-    if (!isIterable(source)) {
+    let iteratorFactory: () => SourceIterator
+    try {
+      // Validation reads the protocol getters the iteration will use; a
+      // throwing getter after the method allocated its result still unwinds
+      // the invocation and its borrows exactly once.
+      iteratorFactory = sourceIteratorFactory(source, prepared.endpoint)
+    } catch (error) {
       try {
         await prepared.invocation.close()
       } finally {
         prepared.releaseBorrows()
       }
-      throw new TypertGatewayError(
-        'gateway/result-invalid',
-        prepared.endpoint,
-        'stream Remote method did not return Iterable or AsyncIterable',
-        { field: 'result' },
-      )
+      throw error
     }
     // The returned async iterable keeps every borrow until the source's
-    // actual iterator cleanup completes, including a never-started generator.
-    return ownedStream(source, prepared.endpoint, prepared.invocation, prepared.releaseBorrows)
+    // actual iterator cleanup completes, including a never-started iterator.
+    return ownedStream(iteratorFactory, prepared.endpoint, prepared.invocation, prepared.releaseBorrows)
   }
 
   private async dispatchRpc(
@@ -1365,20 +1366,46 @@ function assertPeerLive(peer: PeerScope, endpoint: string): void {
   }
 }
 
-function isIterable(value: unknown): value is Iterable<unknown> | AsyncIterable<unknown> {
-  return isObject(value)
-    && (typeof Reflect.get(value, Symbol.iterator) === 'function'
-      || typeof Reflect.get(value, Symbol.asyncIterator) === 'function')
+/** The protocol iterator a stream Remote method produces, sync or async. */
+type SourceIterator = AsyncIterator<unknown> | Iterator<unknown>
+
+/**
+ * Validate a method result and capture the protocol factories that create its
+ * iterator. Both getters are read once, so validation and creation observe the
+ * same source and a throwing getter stays inside the invocation cleanup path.
+ * @param source - value returned by the Remote method.
+ * @param endpoint - endpoint named in the failure.
+ * @returns a factory for the single business iterator.
+ * @throws {@link TypertGatewayError} `gateway/result-invalid` when the value
+ *   implements neither iteration protocol; a source getter's own error otherwise.
+ */
+function sourceIteratorFactory(source: unknown, endpoint: string): () => SourceIterator {
+  if (isObject(source)) {
+    const asyncFactory: unknown = Reflect.get(source, Symbol.asyncIterator)
+    const syncFactory: unknown = Reflect.get(source, Symbol.iterator)
+    if (typeof asyncFactory === 'function') {
+      return () => Reflect.apply(asyncFactory, source, []) as AsyncIterator<unknown>
+    }
+    if (typeof syncFactory === 'function') {
+      return () => Reflect.apply(syncFactory as (...args: never[]) => Iterator<unknown>, source, [])
+    }
+  }
+  throw new TypertGatewayError(
+    'gateway/result-invalid',
+    endpoint,
+    'stream Remote method did not return Iterable or AsyncIterable',
+    { field: 'result' },
+  )
 }
 
 async function *cancellableStream(
-  source: Iterable<unknown> | AsyncIterable<unknown>,
+  sourceIterator: () => SourceIterator,
   endpoint: string,
   invocation: GatewayInvocation,
   release: () => void,
 ): AsyncGenerator {
   const { signal } = invocation
-  let iterator: AsyncIterator<unknown> | Iterator<unknown> | undefined
+  let iterator: SourceIterator | undefined
   let pending: Promise<IteratorResult<unknown>> | undefined
   let rejectAbort: ((error: unknown) => void) | undefined
   const onAbort = (): void => {
@@ -1386,13 +1413,9 @@ async function *cancellableStream(
   }
   signal.addEventListener('abort', onAbort, { once: true })
   try {
-    // A custom iterable may throw while creating its iterator; the borrows
-    // acquired for the invocation still need their one release.
-    const asyncFactory: unknown = Reflect.get(source, Symbol.asyncIterator)
-    const syncFactory: unknown = Reflect.get(source, Symbol.iterator)
-    iterator = typeof asyncFactory === 'function'
-      ? Reflect.apply(asyncFactory, source, []) as AsyncIterator<unknown>
-      : Reflect.apply(syncFactory as (...args: never[]) => Iterator<unknown>, source, [])
+    // The owning wrapper memoizes creation, so this is the stream's one
+    // business iterator; a throwing factory still unwinds the borrows.
+    iterator = sourceIterator()
     while (true) {
       if (signal.aborted) throw streamAbortFailure(endpoint, signal.reason)
       // Reusing a pending cancellation promise retains every completed race.
@@ -1434,33 +1457,51 @@ async function *cancellableStream(
 /**
  * Keep Host borrows for the actual source iterator lifetime. The wrapper covers
  * cancellation before the first `next()`, where an async generator's body and
- * `finally` never run, while still letting {@link cancellableStream} own
- * cleanup for started streams.
- * @param source - the business iterable returned by the Remote method.
+ * `finally` never run, while {@link cancellableStream} owns cleanup for started
+ * streams. Both paths share one memoized source iterator and never replay the
+ * Remote method or call `next()` during unstarted cleanup.
+ * @param iteratorFactory - creates the business iterator when the stream starts
+ *   or closes early; called at most once per wrapper iterator.
  * @param endpoint - canonical endpoint for cancellation failures.
  * @param invocation - carrier state closed after the source is done.
  * @param release - releases every acquired borrow exactly once.
- * @returns an iterable whose cleanup closes the uplink before releasing borrows.
+ * @returns an iterable whose cleanup closes the uplink and the source iterator
+ *   before releasing borrows.
  */
 function ownedStream(
-  source: Iterable<unknown> | AsyncIterable<unknown>,
+  iteratorFactory: () => SourceIterator,
   endpoint: string,
   invocation: GatewayInvocation,
   release: () => void,
 ): AsyncIterable<unknown> {
-  const generator = cancellableStream(source, endpoint, invocation, release)
   return {
     [Symbol.asyncIterator](): AsyncIterator<unknown> {
+      let source: SourceIterator | undefined
+      const sourceIterator = (): SourceIterator => {
+        // Started iteration and an unstarted close are exclusive per wrapper
+        // iterator, so the factory runs once; the memoized read also keeps a
+        // return-then-next misuse from replaying the business factory.
+        /* v8 ignore next -- the two source paths are exclusive per wrapper iterator */
+        if (source === undefined) source = iteratorFactory()
+        return source
+      }
+      const generator = cancellableStream(sourceIterator, endpoint, invocation, release)
       const iterator = generator[Symbol.asyncIterator]()
       let started = false
       let finished = false
       // A generator cancelled before its first next() has not entered the
-      // body, so its own finally cannot run; the wrapper performs that cleanup.
+      // body, so its own finally cannot run. The wrapper closes the carrier
+      // and awaits the real business iterator's cleanup itself; it never calls
+      // next() and never replays the method that allocated the iterator.
       const finishBeforeStart = async (): Promise<void> => {
         if (started || finished) return
         finished = true
         try {
-          await invocation.close()
+          try {
+            await invocation.close()
+          } finally {
+            await sourceIterator().return?.()
+          }
         } finally {
           release()
         }

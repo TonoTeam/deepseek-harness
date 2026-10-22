@@ -58,12 +58,20 @@ class BorrowService extends Service {
   }
 
   customSource: Iterable<unknown> | AsyncIterable<unknown> | undefined
+  customCalls = 0
 
   @Remote({ mode: 'stream' })
   custom(agent: FixtureAgent): Iterable<unknown> | AsyncIterable<unknown> {
     void agent
+    this.customCalls += 1
     if (this.customSource === undefined) throw new Error('custom source was not configured')
     return this.customSource
+  }
+
+  @Remote({ mode: 'stream' })
+  plain(agent: FixtureAgent): object {
+    void agent
+    return { not: 'iterable' }
   }
 
   @Remote
@@ -236,6 +244,75 @@ describe('Gateway Host borrowing', () => {
     }))[Symbol.asyncIterator]()
     await expect(failed.next()).rejects.toThrow('factory failed')
     expect(release).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns an unstarted custom iterator before releasing its borrow, without a next or replay', async () => {
+    const { ctx, service } = await setup()
+    const release = vi.fn()
+    registerLookup(ctx, 'borrowAgent', 'agent', () => ({ value: { id: 'agent-1' }, release }))
+    const sourceCleanup = Promise.withResolvers<undefined>()
+    const returned = vi.fn(async (): Promise<IteratorResult<unknown>> => {
+      await sourceCleanup.promise
+      return { done: true, value: undefined }
+    })
+    const next = vi.fn((): Promise<IteratorResult<unknown>> =>
+      Promise.resolve({ done: true, value: undefined }))
+    service.customSource = {
+      [Symbol.asyncIterator]: () => ({ next, return: returned }),
+    }
+    const iterator = (await ctx.typertGateway.stream({
+      peer: ownerPeer(ctx),
+      namespace: 'borrow',
+      method: 'custom',
+      args: { agentId: 'agent-1' },
+    }))[Symbol.asyncIterator]()
+
+    const closing = iterator.return?.(undefined)
+    // The business iterator owns resources allocated when the method returned
+    // it: its own asynchronous return cleanup must own the Agent pin.
+    await vi.waitFor(() => { expect(returned).toHaveBeenCalledOnce() })
+    expect(next).not.toHaveBeenCalled()
+    expect(release).not.toHaveBeenCalled()
+    sourceCleanup.resolve(undefined)
+    await expect(closing).resolves.toEqual({ done: true, value: undefined })
+    expect(release).toHaveBeenCalledOnce()
+    // A repeated close stays idempotent: the wrapper never re-enters the
+    // business iterator cleanup or releases the borrow twice.
+    await expect(iterator.return?.(undefined)).resolves.toEqual({ done: true, value: undefined })
+    expect(returned).toHaveBeenCalledOnce()
+    expect(release).toHaveBeenCalledOnce()
+    // Unstarted cleanup closes the one business iterator; the Remote method was
+    // invoked once and is never replayed to obtain a fresh source.
+    expect(service.customCalls).toBe(1)
+  })
+
+  it('releases the borrow when a source getter throws during stream validation', async () => {
+    const { ctx, service } = await setup()
+    const release = vi.fn()
+    registerLookup(ctx, 'borrowAgent', 'agent', () => ({ value: { id: 'agent-1' }, release }))
+    service.customSource = {
+      get [Symbol.asyncIterator](): () => AsyncIterator<unknown> {
+        throw new Error('iterator getter failed')
+      },
+    }
+    await expect(ctx.typertGateway.stream({
+      peer: ownerPeer(ctx),
+      namespace: 'borrow',
+      method: 'custom',
+      args: { agentId: 'agent-1' },
+    })).rejects.toThrow('iterator getter failed')
+    expect(release).toHaveBeenCalledOnce()
+
+    // A value implementing neither protocol is refused through the same
+    // cleanup path instead of escaping as an uncleaned validation error.
+    await expect(ctx.typertGateway.stream({
+      peer: ownerPeer(ctx),
+      namespace: 'borrow',
+      method: 'plain',
+      args: { agentId: 'agent-1' },
+    })).rejects.toMatchObject({ code: 'gateway/result-invalid' })
+    expect(release).toHaveBeenCalledTimes(2)
+    expect(service.customCalls).toBe(1)
   })
 
   it('decides access before acquiring a borrow', async () => {

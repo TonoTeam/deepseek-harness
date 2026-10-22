@@ -107,6 +107,9 @@ async function commandHarness(
     selectionFor: () => selection,
     serializeImageAdmission: <Value>(_agent: Agent, operation: () => Promise<Value>) => operation(),
     composeAgent: () => Promise.resolve({ setup: () => {} }),
+    withRetainedAgent: <Value>(id: SessionId, operation: (owned: Agent) => Promise<Value>) => id === agent.id
+      ? operation(agent)
+      : Promise.reject(new RemoteError('session/not-found', 'missing', { sessionId: id })),
   } as unknown as ApiSessionAgentController
   return {
     ctx,
@@ -129,7 +132,7 @@ describe('Session queue commands', () => {
     await ctx.plugin(AgentRegistry)
     const error = new RemoteError('session/agent-busy', 'owned by a child', { reason: 'subagent-owned' })
     const controller = new SessionCommandController(ctx, {
-      resolveAgent: () => Promise.resolve({ error }),
+      withRetainedAgent: () => Promise.reject(error),
     } as unknown as ApiSessionAgentController, '/workspace')
     try {
       await expect(controller.updateQueue({

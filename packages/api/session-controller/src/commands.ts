@@ -433,15 +433,23 @@ export class SessionCommandController {
         )
       }
     }
-    let agent = this.ctx.agents.get(request.sessionId)
-    if (agent === undefined) {
-      const found = await this.agents.resolveAgent(request.sessionId)
-      if ('error' in found) {
-        if (found.error.code !== 'session/not-found') throw found.error
+    try {
+      // The cold restore yields before the mutation; retaining the exact Agent
+      // keeps a concurrent idle sweep from sealing it in that window. Only the
+      // acquisition retries; this mutation itself runs at most once.
+      return await this.agents.withRetainedAgent(
+        request.sessionId,
+        agent => Promise.resolve(this.mutateQueue(agent, request)),
+      )
+    } catch (error) {
+      if (remoteErrorOf(error)?.code === 'session/not-found') {
         throw new RemoteError('session/queue-item-not-found', 'queued item is no longer pending', { itemId: request.itemId })
       }
-      agent = found.agent
+      throw error
     }
+  }
+
+  private mutateQueue(agent: Agent, request: SessionUpdateQueueRequest): SessionUpdateQueueValue {
     if (hasApiSessionSubagentOwner(this.ctx, agent.session, agent)) {
       const identity = this.ctx.sessionProjections
         .snapshot(agent.session, ['subagent'])
