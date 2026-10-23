@@ -58,7 +58,9 @@ One optional asynchronous provider may be registered through `ctx.sessionTitle.r
 
 ### Reading titles
 
-`get(session)` reads the latest folded title from one live or replayed session, and `foldSessionTitle(events)` is the pure fold over a log. The service requires `ctx.sessionProjections` and registers two units: the client-visible `title` unit (the accepted title string for client list rows) and the host-only `titleInput` unit, which folds the first and latest eligible messages plus their count so scheduling and fallback reads are O(1) through `stateOf()`; the full eligible prefix for one provider generation is scanned from the session log at execution time. An explicit `refresh(session)` materializes the fallback when needed, then explicitly runs the registered provider over the current eligible messages.
+`get(session)` reads the latest folded title from one live or replayed session, and `foldSessionTitle(events)` is the pure fold over a log. The service requires `ctx.sessionProjections` and registers two units: the client-visible `title` unit (state version 1, unchanged: the accepted title string for client list rows) and the host-only `titleInput` unit at state version 4. `titleInput` stores only `firstSeq`, `count`, and `lastSeq` — the oldest eligible `user/message` seq, the number folded, and the newest seq — so scheduling and fallback reads are O(1) through `stateOf()` without duplicating first-message text in the cache. Version-3 `titleInput` rows are not readable at v4; the title package's `@deepseek-ai/dsh-session-title/projection-cache-cleanup` entry calls `ctx.sessionProjectionCache.discardObsoleteProjectionRows('titleInput', 4)` during boot to remove those obsolete cold rows, and a cold read refolds the seqs from the authoritative log. The `title` wire projection and the Session log format do not change with this maintenance. The full eligible prefix for one provider generation is still scanned from the session log at execution time.
+
+`ctx.sessions.readEvent(session, seq, { signal })` reads one exact committed event from the exact live Session, including fork-inherited and not-yet-flushed history; today the live Session log is array-backed, so this is a bounded asynchronous read of that log, not a streaming disk read. An explicit `refresh(session)` materializes the fallback when needed, then explicitly runs the registered provider over the current eligible messages; the pinned user-title fallback path reserves its revision before its one asynchronous event read and is tracked through service teardown.
 
 ### Failures and recovery
 
@@ -83,12 +85,14 @@ Titles are durable, log-only state: every accepted revision is a `session/title`
 | File | Role |
 |---|---|
 | [`src/index.ts`](src/index.ts) | Service: config, fold, fallback scheduling, provider registry, concurrency, `title` projection unit |
+| [`src/title-input.ts`](src/title-input.ts) | Internal seq-only `titleInput` unit (state version 4) and the shared eligible-message extraction |
+| [`src/projection-cache-cleanup.ts`](src/projection-cache-cleanup.ts) | Boot entry that prunes obsolete cold `titleInput` checkpoint rows |
 | [`src/normalize.ts`](src/normalize.ts) | Title-text cleaning, UTF-8-safe truncation, and the deterministic fallback |
 | [`src/types.ts`](src/types.ts) | One home of the `title` projection-key declaration |
 
 ### Lifecycle and concurrency
 
-Per-session work state tracks a revision counter, an in-flight fallback, and pending and active provider work. A newer user message, provider disposal, session disposal, or explicit refresh aborts older work through an `AbortController`; a completion whose provider, revision, session, or signal is stale cannot append. Explicit refreshes reserve their revision before provider work; overlapping automatic and explicit fallback requests share one session-local in-flight append. Service teardown cancels queued work and drains calls that ignore cancellation before unloading completes.
+Per-session work state tracks a revision counter, an in-flight fallback, pending and active provider work, and any pinned-refresh read operations. A newer user message, provider disposal, session disposal, or explicit refresh aborts older work through an `AbortController`; a completion whose provider, revision, session, or signal is stale cannot append. Explicit refreshes reserve their revision before provider work; the pinned fallback read composes the caller, service lifetime, and exact-Session signals, is tracked for teardown, and rechecks its revision, provider, title event, cancellation, and store ownership immediately before the synchronous append. Overlapping automatic and explicit fallback requests share one session-local in-flight append. Service teardown cancels queued work and drains calls that ignore cancellation before unloading completes.
 
 ### Normalization
 

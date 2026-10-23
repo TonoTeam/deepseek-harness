@@ -149,6 +149,7 @@
       "@deepseek-ai/dsh-tool-todo/client": ["./packages/todo/tool-todo/src/client.ts"],
       "@deepseek-ai/dsh-session-title/types": ["./packages/session/session-title/src/types.ts"],
       "@deepseek-ai/dsh-session-title/client": ["./packages/session/session-title/src/client.ts"],
+      "@deepseek-ai/dsh-session-title/projection-cache-cleanup": ["./packages/session/session-title/src/projection-cache-cleanup.ts"],
       "@deepseek-ai/dsh-subagent/client": ["./packages/subagent/subagent/src/client.ts"],
       "@deepseek-ai/dsh-subagent/internal": ["./packages/subagent/subagent/src/internal.ts"],
       "@deepseek-ai/dsh-workspace/types": ["./packages/workspace/workspace/src/types.ts"],

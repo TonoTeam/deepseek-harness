@@ -61,6 +61,8 @@ The built-in `working_directory` tool changes the directory for subsequent opera
         maxOutputChars: 16000
 ```
 
+The bundle also mounts the title-input projection-cache cleanup entry. The Loader holds boot readiness on that entry while it prunes obsolete derived title-input rows written before state version 4; the authoritative session log, attachments, and workspace are untouched, and the standalone `sdk-minimal` profile does not mount the projection cache or this entry.
+
 The bundle mounts [MCP resources](../../mcp/mcp-resources/README.md) once. Configure only [MCP client entries](../../mcp/mcp-client/README.md) for the servers you need. Clients mounted by another provider also count as configured in their scope. Callers with no configured server in scope receive no MCP tools or prompt text.
 
 ### Shell tools per platform

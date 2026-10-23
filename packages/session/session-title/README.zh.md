@@ -58,7 +58,9 @@ kind: "package-reference"
 
 ### 读取标题
 
-`get(session)` 从活跃或回放会话读取折叠出的最新标题，`foldSessionTitle(events)` 是对日志的纯折叠。服务要求 `ctx.sessionProjections` 并注册两个单元：客户端可见的 `title` 单元（供客户端列表行使用的已接受标题字符串）和仅供 host 使用的 `titleInput` 单元——后者折叠第一条与最新一条合格消息及其计数，使调度与回退读取通过 `stateOf()` 达到 O(1)；某次提供方生成所需的完整合格前缀，则会在执行时从会话日志中扫描取得。显式 `refresh(session)` 在需要时物化回退，然后对当前符合条件的消息显式运行已注册提供方。
+`get(session)` 从活跃或回放会话读取折叠出的最新标题，`foldSessionTitle(events)` 是对日志的纯折叠。服务要求 `ctx.sessionProjections` 并注册两个单元：客户端可见的 `title` 单元（状态版本 1，保持不变：供客户端列表行使用的已接受标题字符串）和仅供 host 使用的 `titleInput` 单元（状态版本 4）。`titleInput` 只保存 `firstSeq`、`count` 与 `lastSeq`——最旧一条合格 `user/message` 的 seq、已折叠数量与最新 seq——使调度与回退读取通过 `stateOf()` 达到 O(1)，且缓存不再重复保存首条消息文本。版本 3 的 `titleInput` 行在 v4 下不可读；标题包的 `@deepseek-ai/dsh-session-title/projection-cache-cleanup` 条目会在启动期间调用 `ctx.sessionProjectionCache.discardObsoleteProjectionRows('titleInput', 4)` 删除这些过时的冷缓存行，冷读取会从权威日志重新折叠相应 seq。此项维护不改变 `title` wire 投影，也不改变会话日志格式。某次提供方生成所需的完整合格前缀，仍会在执行时从会话日志中扫描取得。
+
+`ctx.sessions.readEvent(session, seq, { signal })` 从确切的活跃 Session 读取一条确切的已提交事件，包括 fork 继承的与尚未刷盘的历史；当前活跃 Session 日志由数组支持，因此这是对该日志的有界异步读取，并非流式磁盘读取。显式 `refresh(session)` 在需要时物化回退，然后对当前符合条件的消息显式运行已注册提供方；用户标题钉住后的回退路径会在唯一一次异步事件读取之前预留修订号，并纳入服务拆卸的排空跟踪。
 
 ### 失败与恢复
 
@@ -83,12 +85,14 @@ kind: "package-reference"
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 服务：配置、折叠、回退调度、提供方注册表、并发、`title` 投影单元 |
+| [`src/title-input.ts`](src/title-input.ts) | 内部的仅 seq `titleInput` 单元（状态版本 4）与共享的合格消息提取 |
+| [`src/projection-cache-cleanup.ts`](src/projection-cache-cleanup.ts) | 启动时清除过时冷 `titleInput` 检查点行的条目 |
 | [`src/normalize.ts`](src/normalize.ts) | 标题文本清洗、UTF-8 安全截断与确定性回退 |
 | [`src/types.ts`](src/types.ts) | `title` 投影键声明的归属位置 |
 
 ### 生命周期与并发
 
-每个会话的工作状态维护一个修订计数器、一个进行中的回退，以及待处理与活跃的提供方工作。较新的用户消息、提供方 dispose（资源释放）、会话 dispose 或显式刷新都会通过 `AbortController` 中止旧工作；提供方、修订、会话或信号已陈旧的完成结果无法追加。显式刷新会在提供方工作之前预留修订号；重叠的自动／显式回退请求共享一个会话本地正在进行的追加操作。服务拆卸会取消排队工作，并在卸载完成前等待不响应取消的调用结算。
+每个会话的工作状态维护一个修订计数器、一个进行中的回退、待处理与活跃的提供方工作，以及所有用户标题钉住后的刷新读取操作。较新的用户消息、提供方 dispose（资源释放）、会话 dispose 或显式刷新都会通过 `AbortController` 中止旧工作；提供方、修订、会话或信号已陈旧的完成结果无法追加。显式刷新会在提供方工作之前预留修订号；钉住后的回退读取组合调用方、服务生命周期与确切会话信号，被纳入拆卸跟踪，并在同步追加之前立即复查修订、提供方、标题事件、取消状态与存储归属。重叠的自动／显式回退请求共享一个会话本地正在进行的追加操作。服务拆卸会取消排队工作，并在卸载完成前等待不响应取消的调用结算。
 
 ### 规范化
 

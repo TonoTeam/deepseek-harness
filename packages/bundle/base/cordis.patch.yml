@@ -199,6 +199,13 @@
         writeEveryEvents: 200
         writeIntervalMs: 5000
 
+    # Reference-only title input cleanup: discard derived titleInput checkpoint
+    # rows written before state version 4, when they retained first-message
+    # text. The authoritative JSONL log, attachments, and workspace are not
+    # touched; cold reads refold any discarded title input from the log.
+    - id: session-title-projection-cache-cleanup
+      name: '@deepseek-ai/dsh-session-title/projection-cache-cleanup'
+
     - id: otel
       name: '@deepseek-ai/dsh-otel'
 

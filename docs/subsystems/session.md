@@ -1106,6 +1106,24 @@ announce(session: Session): void
 async flush(session: Session): Promise<boolean>
 
 /**
+ * Read one committed event from the exact live Session, including inherited
+ * fork history and events not yet flushed to persistence.
+ *
+ * The read is bounded to the addressed entry in the live in-memory,
+ * array-backed log; it does not materialize a snapshot or read a streaming
+ * disk log. Exact store ownership is checked before and after one
+ * asynchronous boundary, and cancellation is checked at both points. The
+ * returned event is the existing frozen log object.
+ * @param session - the exact live Session object from this store.
+ * @param seq - event position in that Session.
+ * @param options - optional cancellation checked before and after the read's asynchronous boundary.
+ * @returns the existing frozen event, or undefined when the live log has no event at `seq`.
+ * @throws when `session` is not this store's live instance (detached, disposed, or
+ *   owned by another store) or when cancellation fires.
+ */
+async readEvent( session: Session, seq: SessionSeq, options?: SessionEventReadOptions, ): Promise<SessionEvent | undefined>
+
+/**
  * Look up a live session.
  * @param id - the session id to look up.
  * @returns the session, or undefined when no live session has that id.

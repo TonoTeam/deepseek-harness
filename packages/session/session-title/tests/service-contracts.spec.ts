@@ -2,6 +2,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import SessionStore, { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SessionTitleService, {
   SessionTitleProviderId,
@@ -356,6 +357,175 @@ describe('SessionTitleService configuration and refresh boundaries', () => {
     await settle()
     expect(ctx.sessionTitle.get(session)).toBeUndefined()
     await expect(ctx.sessionTitle.refresh(session)).resolves.toBeUndefined()
+  })
+})
+
+interface HeldRead {
+  readonly promise: Promise<SessionEvent | undefined>
+  readonly resolve: (event: SessionEvent | undefined) => void
+}
+
+/** Replace the exact live read with a per-call gate for deterministic read races. */
+function holdReads(ctx: Context): { readonly gates: HeldRead[]; release(): void } {
+  const gates: HeldRead[] = []
+  const spy = vi.spyOn(ctx.sessions, 'readEvent').mockImplementation(() => {
+    const gate = deferred<SessionEvent | undefined>()
+    gates.push(gate)
+    return gate.promise
+  })
+  return { gates, release: () => { spy.mockRestore() } }
+}
+
+/** Read one source event through the exact live read before any held-read spy. */
+async function sourceEventAt(ctx: Context, session: Session, seq: SessionSeq): Promise<SessionEvent> {
+  const event = await ctx.sessions.readEvent(session, seq)
+  if (event === undefined) throw new Error(`missing source event at ${String(seq)}`)
+  return event
+}
+
+describe('SessionTitleService asynchronous pinned refresh', () => {
+  it('reserves before the read so a newer rename and refresh supersede a delayed pinned fallback', async () => {
+    const ctx = await setup()
+    const session = startSession(ctx, 'pinned-async-order')
+    const source = appendPrompt(session, 'Delayed pinned fallback')
+    await settle()
+    const sourceEvent = await sourceEventAt(ctx, session, source.seq)
+    ctx.sessionTitle.rename(session, 'Pinned first')
+    const held = holdReads(ctx)
+    try {
+      const renamed = ctx.sessionTitle.refresh(session)
+      await settle()
+      expect(held.gates).toHaveLength(1)
+      ctx.sessionTitle.rename(session, 'Newer rename')
+      held.gates[0]!.resolve(sourceEvent)
+      await expect(renamed).resolves.toMatchObject({ title: 'Newer rename', source: { kind: 'user' } })
+
+      const older = ctx.sessionTitle.refresh(session)
+      await settle()
+      expect(held.gates).toHaveLength(2)
+      const newer = ctx.sessionTitle.refresh(session)
+      await settle()
+      expect(held.gates).toHaveLength(3)
+
+      // The newer refresh owns the reserved revision and appends exactly one
+      // fallback; the older read that resolves afterward cannot append again.
+      held.gates[2]!.resolve(sourceEvent)
+      await expect(newer).resolves.toMatchObject({
+        title: 'Delayed pinned fallback',
+        source: { kind: 'fallback' },
+      })
+      const settledEventSeq = ctx.sessionTitle.get(session)?.eventSeq
+      held.gates[1]!.resolve(sourceEvent)
+      await expect(older).resolves.toMatchObject({ title: 'Delayed pinned fallback' })
+      expect(ctx.sessionTitle.get(session)?.eventSeq).toBe(settledEventSeq)
+    } finally {
+      held.release()
+    }
+  })
+
+  it('checks cancellation, disposal, and provider replacement after the delayed pinned read', async () => {
+    const aborted = await setup()
+    const abortedSession = startSession(aborted, 'pinned-abort')
+    const abortedSource = appendPrompt(abortedSession, 'Abort pinned refresh')
+    await settle()
+    const abortedEvent = await sourceEventAt(aborted, abortedSession, abortedSource.seq)
+    aborted.sessionTitle.rename(abortedSession, 'Pinned abort')
+    const abortedHeld = holdReads(aborted)
+    try {
+      const controller = new AbortController()
+      const abortedRefresh = aborted.sessionTitle.refresh(abortedSession, controller.signal)
+      await settle()
+      controller.abort(new Error('caller stopped pinned refresh'))
+      abortedHeld.gates[0]!.resolve(abortedEvent)
+      await expect(abortedRefresh).rejects.toThrow('caller stopped pinned refresh')
+      expect(aborted.sessionTitle.get(abortedSession)?.title).toBe('Pinned abort')
+    } finally {
+      abortedHeld.release()
+    }
+
+    const detached = await setup()
+    const disposedSession = detached.sessions.prepare(SessionId('pinned-session-disposal'))
+    const detach = detached.sessions.enter(disposedSession)
+    detached.sessions.announce(disposedSession)
+    disposedSession.append('turn/start', { turn: 1 })
+    const disposedSource = appendPrompt(disposedSession, 'Dispose pinned session')
+    await settle()
+    const disposedEvent = await sourceEventAt(detached, disposedSession, disposedSource.seq)
+    detached.sessionTitle.rename(disposedSession, 'Pinned disposal')
+    const disposedHeld = holdReads(detached)
+    try {
+      const disposedRefresh = detached.sessionTitle.refresh(disposedSession)
+      await settle()
+      const pinnedEventSeq = detached.sessionTitle.get(disposedSession)?.eventSeq
+      detach()
+      disposedHeld.gates[0]!.resolve(disposedEvent)
+      await expect(disposedRefresh).rejects.toThrow('session disposed during title generation')
+      expect(detached.sessionTitle.get(disposedSession)?.eventSeq).toBe(pinnedEventSeq)
+    } finally {
+      disposedHeld.release()
+    }
+
+    const serviceCtx = new Context()
+    await serviceCtx.plugin(SessionStore)
+    await serviceCtx.plugin(SessionProjectionRegistry)
+    const fiber = await serviceCtx.plugin(SessionTitleService, CONFIG)
+    const serviceSession = startSession(serviceCtx, 'pinned-service-disposal')
+    const serviceSource = appendPrompt(serviceSession, 'Dispose pinned service')
+    await settle()
+    const serviceEvent = await sourceEventAt(serviceCtx, serviceSession, serviceSource.seq)
+    serviceCtx.sessionTitle.rename(serviceSession, 'Pinned service')
+    const serviceHeld = holdReads(serviceCtx)
+    try {
+      const serviceRefresh = serviceCtx.sessionTitle.refresh(serviceSession)
+      await settle()
+      const outcome = serviceRefresh.then(() => undefined, (error: unknown) => error)
+      const disposal = fiber.dispose()
+      let disposed = false
+      void disposal.then(() => { disposed = true })
+      // Unaborted read still held: teardown drains it instead of finishing.
+      await settle()
+      expect(disposed).toBe(false)
+      serviceHeld.gates[0]!.resolve(serviceEvent)
+      const error = await outcome
+      expect(error).toBeInstanceOf(Error)
+      if (!(error instanceof Error)) throw new Error('expected the pinned refresh to reject')
+      expect(error.message).toBe('session-title service disposed')
+      await disposal
+      expect(disposed).toBe(true)
+    } finally {
+      serviceHeld.release()
+    }
+
+    const replaced = await setup()
+    const replacedSession = startSession(replaced, 'pinned-provider-replacement')
+    const replacedSource = appendPrompt(replacedSession, 'Replace the pinned provider')
+    await settle()
+    const replacedEvent = await sourceEventAt(replaced, replacedSession, replacedSource.seq)
+    replaced.sessionTitle.rename(replacedSession, 'Pinned provider')
+    const replacedHeld = holdReads(replaced)
+    let disposeProvider: (() => Promise<void>) | undefined
+    try {
+      const replacedRefresh = replaced.sessionTitle.refresh(replacedSession)
+      await settle()
+      expect(replacedHeld.gates).toHaveLength(1)
+      disposeProvider = replaced.sessionTitle.register({
+        id: SessionTitleProviderId('replacement-during-read'),
+        automatic: 'first-prompt',
+        async generate() {
+          return { title: 'Provider title', messageSeqs: [replacedSource.seq] }
+        },
+      })
+      const beforeReplacement = replaced.sessionTitle.get(replacedSession)?.eventSeq
+      replacedHeld.gates[0]!.resolve(replacedEvent)
+      await expect(replacedRefresh).resolves.toMatchObject({
+        title: 'Pinned provider',
+        source: { kind: 'user' },
+      })
+      expect(replaced.sessionTitle.get(replacedSession)?.eventSeq).toBe(beforeReplacement)
+    } finally {
+      replacedHeld.release()
+      if (disposeProvider !== undefined) await disposeProvider()
+    }
   })
 })
 

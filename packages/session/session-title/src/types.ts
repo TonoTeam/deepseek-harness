@@ -66,10 +66,10 @@ export interface SessionTitleUserMessage {
   readonly text: string
 }
 
-/** Eligible title input stored as a bounded aggregate. */
+/** Eligible title input stored as a bounded seq-only aggregate. */
 export interface TitleInputState {
-  /** The oldest eligible message, or null before any. */
-  readonly first: SessionTitleUserMessage | null
+  /** Seq of the oldest eligible message, or null before any. */
+  readonly firstSeq: OptionalSessionSeq
   /** Total eligible messages folded so far. */
   readonly count: number
   /** Seq of the newest eligible message, or null before any. */
