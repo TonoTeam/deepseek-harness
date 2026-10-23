@@ -93,6 +93,8 @@ The domain layer is a single implementation, not an abstracted seam: consumers d
 
 `DomainFacility.open(spec)` runs a strict sequence, each step failing the whole call: reject a name already open or still closing (`already-open`); resolve the route (`backend-not-found`); require the `kv` facet (`facet-unsupported`); open the unit (backend `version-mismatch`/`malformed-medium` pass through); load and validate every stored record and the global against the spec's schemas (`invalid-record`); construct the domain. The caller owns the handle; the facility closes any domain left open when it unmounts, and a closed domain's name frees for reopening only after teardown completes.
 
+The raw `loadAll` snapshot is open-time state used for schema validation. The opened domain retains the validated live tables and the backend unit, while the close callback carries only the facility and the domain name, not the open activation that read the snapshot. The open-time bootstrap is therefore released when `open` completes, even while the domain stays open. This is a lifecycle-ownership property, not a measured production RSS claim.
+
 ### Source map
 
 | File | Role |
