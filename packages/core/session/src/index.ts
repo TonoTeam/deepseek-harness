@@ -15,7 +15,7 @@ import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
-import type { CreateSessionOptions, EpochHeader, PluginRecord, PluginRecordMap, PluginRecordType, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
+import type { CreateSessionOptions, EpochHeader, PluginRecord, PluginRecordMap, PluginRecordType, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventReadOptions, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
 import { SurfaceManager, validateSessionEventData, validateSurfaceMetadata } from './surface.ts'
 import type { SessionSurface, SessionMessageProjection } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
@@ -465,6 +465,9 @@ function assertPluginRecordEvent(value: unknown): asserts value is SessionEvent 
 /** Module-private access to {@link Session}'s record commit, assigned once by its static block. */
 let commitPluginRecord: (session: Session, type: PluginRecordType, data: unknown) => SessionSeq
 
+/** Module-private access to one committed log entry, assigned once by {@link Session}'s static block. */
+let readSessionEvent: (session: Session, seq: SessionSeq) => SessionEvent | undefined
+
 /**
  * Append one experimental plugin record: an event marked `ignorable` whose
  * type is declared in {@link PluginRecordMap}, outside {@link SessionEventMap}.
@@ -828,6 +831,18 @@ export class Session {
 
   static {
     commitPluginRecord = (session, type, data) => session.#appendRecord(type, data)
+    readSessionEvent = (session, seq) => session.#eventAt(seq)
+  }
+
+  /**
+   * Read the stored event at one log position without copying or freezing it.
+   * {@link SessionStore.readEvent} is the only caller; append-only history keeps
+   * the returned frozen event stable.
+   * @param seq - event position in this log.
+   * @returns the committed event, or undefined when no event occupies `seq`.
+   */
+  #eventAt(seq: SessionSeq): SessionEvent | undefined {
+    return this.log[seq]
   }
 
   /**
@@ -1342,6 +1357,39 @@ export class SessionStore extends Service {
       throw new Error(`session "${session.id}" is not live in this store`)
     }
     return entry
+  }
+
+  /**
+   * Read one committed event from the exact live Session, including inherited
+   * fork history and events not yet flushed to persistence.
+   *
+   * The read is bounded to the addressed entry in the live in-memory,
+   * array-backed log; it does not materialize a snapshot or read a streaming
+   * disk log. Exact store ownership is checked before and after one
+   * asynchronous boundary, and cancellation is checked at both points. The
+   * returned event is the existing frozen log object.
+   * @param session - the exact live Session object from this store.
+   * @param seq - event position in that Session.
+   * @param options - optional cancellation checked before and after the read's asynchronous boundary.
+   * @returns the existing frozen event, or undefined when the live log has no event at `seq`.
+   * @throws when `session` is not this store's live instance (detached, disposed, or
+   *   owned by another store) or when cancellation fires.
+   */
+  async readEvent(
+    session: Session,
+    seq: SessionSeq,
+    options?: SessionEventReadOptions,
+  ): Promise<SessionEvent | undefined> {
+    const signal = options?.signal
+    signal?.throwIfAborted()
+    this.liveEntryFor(session)
+    // The live log is array-backed, so this yields without I/O. It keeps every
+    // read straddling the same async boundary at which a disposal or abort can
+    // become visible.
+    await Promise.resolve()
+    signal?.throwIfAborted()
+    this.liveEntryFor(session)
+    return readSessionEvent(session, seq)
   }
 
   /**

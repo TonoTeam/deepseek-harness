@@ -94,7 +94,7 @@ export interface Config {
 
 - `inject`: `agents` · `sessions` · `llm` · `tools` · `systemPrompt` · `sessionProjections`
 - `refs`: [`AgentOptions`](subsystems/core.zh.md) · [`SessionId`](subsystems/core.zh.md) · `Volatile` (`@deepseek-ai/cosmokit`)
-- `source`: [`packages/core/agent-loop/src/index.ts:303`](../packages/core/agent-loop/src/index.ts)
+- `source`: [`packages/core/agent-loop/src/index.ts:306`](../packages/core/agent-loop/src/index.ts)
 
 ```ts config-catalog
 /** Agent-loop plugin configuration. */
@@ -184,7 +184,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-api-gateway`
 
 - `inject`: `typert` · `remoteAccess`
-- `source`: [`packages/api/gateway/src/index.ts:156`](../packages/api/gateway/src/index.ts)
+- `source`: [`packages/api/gateway/src/index.ts:159`](../packages/api/gateway/src/index.ts)
 
 ```ts config-catalog
 /** Gateway transport configuration. */
@@ -222,7 +222,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-api-session-controller`
 
 - `inject`: `agentDefaultModel` · `agents` · `attachments` · `fileUploads` · `fs` · `llm` · `remoteAccess` · `sessions` · `sessionProjections` · `sessionQuery` · `typert` · `workspaceRegistry`
-- `source`: [`packages/api/session-controller/src/index.ts:96`](../packages/api/session-controller/src/index.ts)
+- `source`: [`packages/api/session-controller/src/index.ts:112`](../packages/api/session-controller/src/index.ts)
 
 ```ts config-catalog
 /** Session Controller deployment policy. */
@@ -231,6 +231,22 @@ export interface Config {
   readonly nativeOpen?: boolean
   /** Positive integral milliseconds of list work before yielding between complete rows. */
   readonly listWorkSliceMs?: number
+  /** Opt-in safe idle Agent reclamation; disabled by default. */
+  readonly idleEviction?: IdleEvictionDeploymentConfig
+}
+
+/** Opt-in idle reclamation deployment policy; omitted or disabled keeps it off. */
+export interface IdleEvictionDeploymentConfig {
+  /** Whether bounded idle sweeps run. */
+  readonly enabled?: boolean
+  /** Real quiescence time before an Agent is a reclaim candidate. */
+  readonly idleTtlMs?: number
+  /** Delay between bounded, non-overlapping sweeps. */
+  readonly sweepPeriodMs?: number
+  /** Maximum candidates examined by one sweep. */
+  readonly maxPerSweep?: number
+  /** Maximum time the read-only activity proof may keep admission sealed. */
+  readonly reclaimTimeoutMs?: number
 }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-api-session-controller -->
@@ -2852,7 +2868,7 @@ export type JsonlCompression = 'zstd' | 'none'
 ## `@deepseek-ai/dsh-session-projection-cache`
 
 - `inject`: `storageDomain` · `sessionProjections` · `sessions`
-- `source`: [`packages/session/session-projection-cache/src/index.ts:75`](../packages/session/session-projection-cache/src/index.ts)
+- `source`: [`packages/session/session-projection-cache/src/index.ts:76`](../packages/session/session-projection-cache/src/index.ts)
 
 ```ts config-catalog
 /**
@@ -2995,7 +3011,7 @@ export enum SessionTelemetryMode {
 ## `@deepseek-ai/dsh-session-title`
 
 - `inject`: `sessions` · `sessionProjections`
-- `source`: [`packages/session/session-title/src/index.ts:56`](../packages/session/session-title/src/index.ts)
+- `source`: [`packages/session/session-title/src/index.ts:57`](../packages/session/session-title/src/index.ts)
 
 ```ts config-catalog
 /** Required deterministic fallback and accepted-title limits. */

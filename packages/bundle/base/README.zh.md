@@ -61,6 +61,8 @@ kind: "package-bundle"
         maxOutputChars: 16000
 ```
 
+基础组合还挂载标题输入的投影缓存清理条目。Loader 会在该条目执行期间保持启动就绪挂起，由它删除状态版本 4 之前写入的过时派生标题输入行；权威会话日志、附件与工作区不受影响，独立的 `sdk-minimal` profile 既不挂载投影缓存，也不挂载该条目。
+
 本 bundle 统一挂载 [MCP 资源](../../mcp/mcp-resources/README.zh.md)一次。只需为所需服务器配置 [MCP 客户端条目](../../mcp/mcp-client/README.zh.md)。其他提供方挂载的客户端在所属作用域中也属于已配置状态。调用方作用域中没有已配置服务器时，不会获得 MCP 工具或提示词文本。
 
 ### 各平台的 shell 工具

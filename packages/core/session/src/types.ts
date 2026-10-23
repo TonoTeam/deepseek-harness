@@ -65,6 +65,15 @@ export type SessionSeqCursor = SessionSeq | -1
 /** One existing Session event position, or explicit absence. */
 export type OptionalSessionSeq = SessionSeq | null
 
+/** Options for {@link SessionStore.readEvent}. */
+export interface SessionEventReadOptions {
+  /**
+   * Cancellation checked before the store performs the read and again after
+   * its asynchronous boundary. Aborting rejects with the signal's reason.
+   */
+  readonly signal?: AbortSignal
+}
+
 /**
  * Current logical Session format version, stamped into every newly written
  * {@link SessionHeader}. Current Session and persistence code accept only this

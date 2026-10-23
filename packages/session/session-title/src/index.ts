@@ -28,6 +28,7 @@ export type {
   TitleProjection,
 } from './types.ts'
 import { fallbackSessionTitle, normalizeSessionTitle } from './normalize.ts'
+import { sessionTitleUserMessageOf, titleInputProjectionDefinition } from './title-input.ts'
 import type {
   SessionTitleEventData,
   SessionTitleModelIdentity,
@@ -133,17 +134,6 @@ export interface SessionTitleProvider {
   generate(request: SessionTitleProviderRequest): Promise<SessionTitleProviderResult>
 }
 
-/** Extract one eligible human text message from a session event. */
-function sessionTitleUserMessageOf(event: SessionEvent): SessionTitleUserMessage | undefined {
-  if (event.type !== 'user/message' || event.data.source.kind !== 'user') return undefined
-  const content = event.data.content
-  const text = content
-    .filter((block): block is Extract<(typeof content)[number], { type: 'text' }> => block.type === 'text')
-    .map(block => block.text)
-    .join('\n')
-  if (normalizeSessionTitle(text, Number.MAX_SAFE_INTEGER).length === 0) return undefined
-  return { seq: event.seq, text }
-}
 /** Defensive copy of a logged title source (the snapshot must not alias log-owned objects). */
 function copySessionTitleSource(source: SessionTitleSource): SessionTitleSource {
   switch (source.kind) {
@@ -192,6 +182,8 @@ interface SessionTitleWorkState {
   fallback?: Promise<SessionTitleSnapshot | undefined>
   pending?: PendingAutomaticWork
   active?: ActiveProviderWork
+  /** Explicit pinned-refresh reads awaiting their one event. */
+  reads?: Set<AbortController>
 }
 
 /** Validate one positive integer configuration field. */
@@ -215,31 +207,6 @@ function titleSnapshotFromState(state: TitleProjection): SessionTitleSnapshot {
     updatedAt: state.updatedAt,
   })
 }
-
-const EMPTY_TITLE_INPUT: TitleInputState = { first: null, count: 0, lastSeq: null }
-
-const sessionTitleUserMessageSchema: ZodType<SessionTitleUserMessage> = zod.object({
-  seq: zod.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).transform(SessionSeq),
-  text: zod.string(),
-}).strict()
-
-const titleInputStateSchema: ZodType<TitleInputState> = zod.object({
-  first: sessionTitleUserMessageSchema.nullable(),
-  count: zod.number().int().nonnegative(),
-  lastSeq: zod.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).transform(SessionSeq).nullable(),
-}).strict().superRefine((state, context) => {
-  const empty = state.first === null && state.lastSeq === null && state.count === 0
-  const populated = state.first !== null
-    && state.lastSeq !== null
-    && state.count > 0
-    && state.first.seq <= state.lastSeq
-  if (!empty && !populated) {
-    context.addIssue({
-      code: 'custom',
-      message: 'title input state must pair its count with first and last message seqs',
-    })
-  }
-})
 
 /**
  * Collect eligible human text messages from a session log, in seq order.
@@ -336,6 +303,7 @@ export class SessionTitleService extends Service {
       for (const state of this.work.values()) {
         delete state.pending
         state.active?.controller.abort(new Error('session-title service disposed'))
+        for (const read of state.reads ?? []) read.abort(new Error('session-title service disposed'))
       }
       await this.drain(this.inFlight)
       this.work.clear()
@@ -343,21 +311,7 @@ export class SessionTitleService extends Service {
 
     ctx.sessionProjections.register(titleProjectionDefinition)
 
-    ctx.sessionProjections.register<'titleInput', TitleInputState>({
-      key: 'titleInput',
-      stateVersion: 3,
-      stateSchema: titleInputStateSchema,
-      init: () => EMPTY_TITLE_INPUT,
-      apply: (state, event) => {
-        const message = sessionTitleUserMessageOf(event)
-        if (message === undefined) return state
-        return {
-          first: state.first ?? message,
-          count: state.count + 1,
-          lastSeq: message.seq,
-        }
-      },
-    })
+    ctx.sessionProjections.register<'titleInput', TitleInputState>(titleInputProjectionDefinition)
 
     ctx.on('session/event', (session, event) => {
       switch (event.type) {
@@ -379,6 +333,7 @@ export class SessionTitleService extends Service {
       const state = this.work.get(session)
       if (state === undefined) return
       state.active?.controller.abort(new Error('session disposed during title generation'))
+      for (const read of state.reads ?? []) read.abort(new Error('session disposed during title generation'))
       this.work.delete(session)
     })
   }
@@ -446,11 +401,46 @@ export class SessionTitleService extends Service {
       // user title must not short-circuit ensureFallback into a no-op, so
       // re-derive and append the fallback over it when one is derivable.
       const current = this.get(session)
-      const first = input.first
-      if (current?.source.kind === 'user' && first !== null) {
-        this.appendFallback(session, first)
-        signal?.throwIfAborted()
-        return this.get(session)
+      if (current?.source.kind === 'user' && input.firstSeq !== null) {
+        // The fallback source is an async read now. Reserve this refresh's
+        // revision before the first await so any newer rename, refresh, or
+        // provider replacement wins; the post-read checks and append stay in
+        // one synchronous run.
+        const state = this.stateFor(session)
+        const revision = this.supersede(state, 'explicit title refresh superseded older generation')
+        const pinnedEventSeq = current.eventSeq
+        // One owned operation per pinned read: service lifetime and exact
+        // Session disposal both abort it, the caller's signal composes in,
+        // and service teardown drains the tracked read.
+        const read = new AbortController()
+        state.reads ??= new Set()
+        state.reads.add(read)
+        const readSignal = signal === undefined
+          ? AbortSignal.any([read.signal, this.lifetime.signal])
+          : AbortSignal.any([read.signal, this.lifetime.signal, signal])
+        try {
+          const event = await this.track(this.ctx.sessions.readEvent(
+            session,
+            input.firstSeq,
+            { signal: readSignal },
+          ))
+          readSignal.throwIfAborted()
+          this.assertServiceActive()
+          if (this.ctx.sessions.get(session.id) !== session) {
+            throw new Error(`session "${session.id}" is not live in this store`)
+          }
+          if (state.revision !== revision
+            || this.registration !== registration
+            || this.get(session)?.eventSeq !== pinnedEventSeq) {
+            return this.get(session)
+          }
+          const first = event === undefined ? undefined : sessionTitleUserMessageOf(event)
+          if (first !== undefined) this.appendFallback(session, first)
+          return this.get(session)
+        } finally {
+          state.reads.delete(read)
+          if (state.reads.size === 0) delete state.reads
+        }
       }
       const fallback = await this.ensureFallback(session)
       signal?.throwIfAborted()
@@ -810,21 +800,25 @@ export class SessionTitleService extends Service {
     this.assertServiceActive()
     const current = this.get(session)
     if (current !== undefined) return current
-    const first = this.titleInputOf(session).first
-    if (first === null) return undefined
-    const title = fallbackSessionTitle(
-      first.text,
-      this.config.fallbackMaxWords,
-      this.config.fallbackMaxBytes,
-    )
-    if (title.length === 0) return undefined
+    const firstSeq = this.titleInputOf(session).firstSeq
+    if (firstSeq === null) return undefined
     const state = this.stateFor(session)
     if (state.fallback !== undefined) return state.fallback
-    const fallback = Promise.resolve().then(() => {
+    const fallback = Promise.resolve().then(async () => {
+      this.assertServiceActive()
+      const event = await this.ctx.sessions.readEvent(session, firstSeq, { signal: this.lifetime.signal })
       this.assertServiceActive()
       if (this.ctx.sessions.get(session.id) !== session) {
         throw new Error(`session "${session.id}" is not live in this store`)
       }
+      const first = event === undefined ? undefined : sessionTitleUserMessageOf(event)
+      if (first === undefined) return undefined
+      const title = fallbackSessionTitle(
+        first.text,
+        this.config.fallbackMaxWords,
+        this.config.fallbackMaxBytes,
+      )
+      if (title.length === 0) return undefined
       const accepted = this.get(session)
       if (accepted !== undefined) return accepted
       session.append('session/title', {

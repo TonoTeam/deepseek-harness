@@ -150,6 +150,33 @@ describe('SessionTitleService', () => {
     expect(session.snapshotEvents().filter(event => event.type === 'session/title')).toHaveLength(1)
   })
 
+  it('derives the fallback from the first inherited fork seq through the async read', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(SessionTitleService, CONFIG)
+    const parent = ctx.sessions.create(SessionId('fork-title-parent'))
+    parent.append('turn/start', { turn: 1 })
+    const inherited = parent.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'Inherited fork prompt' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    const child = ctx.sessions.fork(parent, undefined, SessionId('fork-title-child'))
+
+    const refreshed = await ctx.sessionTitle.refresh(child)
+
+    expect(refreshed).toMatchObject({
+      title: 'Inherited fork prompt',
+      messageSeqs: [inherited.seq],
+      source: { kind: 'fallback' },
+    })
+    expect(ctx.sessionProjections.stateOf(child, 'titleInput')).toMatchObject({
+      firstSeq: inherited.seq,
+      count: 1,
+      lastSeq: inherited.seq,
+    })
+  })
+
   it('folds the latest title event during replay', () => {
     const seed = Session.create(SessionId('source'))
     seed.append('session/title', {

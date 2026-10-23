@@ -152,10 +152,14 @@ export class DomainFacility {
         // The onClosed hook runs strictly after teardown completes: writes
         // landing during the drain still emit domain/changed, and the name
         // frees up for reopening only once the domain is fully closed.
-        const domain: DomainImpl = new DomainImpl(this.ctx, spec, unit, tables, globalValue, () => {
-          this.domains.delete(spec.name)
-          this.reserved.delete(spec.name)
-        })
+        // Bind the release hook instead of passing an arrow: closures created
+        // in this activation share its context, which holds the raw `loadAll`
+        // snapshot for schema validation. The bound hook captures only the
+        // facility and the name, so the snapshot does not outlive the open
+        // (tests/bootstrap-retention.spec.ts).
+        const domain: DomainImpl = new DomainImpl(
+          this.ctx, spec, unit, tables, globalValue, this.releaseName.bind(this, spec.name),
+        )
         this.domains.set(spec.name, domain)
         // The single type-erasure point: DomainImpl is the untyped runtime,
         // Domain<S> the spec-typed view; the unknown hop is required because
@@ -191,6 +195,15 @@ export class DomainFacility {
    */
   async closeAll(): Promise<void> {
     await Promise.all([...this.domains.values()].map(domain => domain.close()))
+  }
+
+  /**
+   * Release one fully closed domain's registration.
+   * @param name - Name registered when the domain opened.
+   */
+  private releaseName(name: string): void {
+    this.domains.delete(name)
+    this.reserved.delete(name)
   }
 }
 

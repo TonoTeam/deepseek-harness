@@ -11,7 +11,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -36,6 +36,7 @@ import {
 import SessionProjectionCache from '../src/index.ts'
 import { checkpointRecord, projectionCacheDomainSpec } from '../src/spec.ts'
 import type { CheckpointRecord } from '../src/spec.ts'
+import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionStateMap {
@@ -46,6 +47,11 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
     'cache-test/secret': string
     'cache-test/marks3': MarksState
     title: string | null
+    titleInput: {
+      readonly firstSeq: SessionSeq | null
+      readonly count: number
+      readonly lastSeq: SessionSeq | null
+    }
   }
   interface SessionProjectionMap {
     'cache-test/marks': { marks: string[] }
@@ -807,5 +813,172 @@ describe('SessionProjectionCache cold-read seeding', () => {
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('cold-read write-back for "cold-fail" failed'))
     }, { timeout: 5_000 })
+  })
+})
+
+/** The cache's open domain table, read through its private handle for white-box assertions. */
+function domainTable(cache: SessionProjectionCache): KvTable<SessionId, CheckpointRecord> {
+  const table: unknown = Reflect.get(cache, 'table')
+  if (table === undefined) throw new Error('cache has not opened its domain table')
+  return table as KvTable<SessionId, CheckpointRecord>
+}
+
+describe('SessionProjectionCache discardObsoleteProjectionRows', () => {
+  const OLD_TEXT = 'legacy-title-input-'.repeat(2048)
+  const identity = {
+    formatVersion: SESSION_FORMAT_VERSION,
+    createdAt: 42,
+    cwd: '/tmp/archived',
+    isSeeded: false,
+    inheritedEventCount: SessionLogOffset(0),
+  } as const
+
+  const obsoleteTitleInput = () => ({
+    ver: 3,
+    seq: SessionSeq(3),
+    val: { first: { seq: 1, text: OLD_TEXT }, count: 1, lastSeq: 3 },
+  })
+
+  const titleInputUnit = {
+    key: 'titleInput',
+    stateVersion: 4,
+    stateSchema: z.object({
+      firstSeq: z.number().int().nonnegative().transform(SessionSeq).nullable(),
+      count: z.number().int().nonnegative(),
+      lastSeq: z.number().int().nonnegative().transform(SessionSeq).nullable(),
+    }),
+    init: () => ({ firstSeq: null, count: 0, lastSeq: null }),
+    apply: state => state,
+  } satisfies ProjectionDefinition<'titleInput', {
+    firstSeq: SessionSeq | null
+    count: number
+    lastSeq: SessionSeq | null
+  }>
+
+  const preservationCases: [string, CheckpointRecord['rows']][] = [
+    ['title', { title: { ver: 1, seq: SessionSeq(2), val: 'kept title' } }],
+    ['unknown', { 'cache-test/unknown': { ver: 1, seq: SessionSeq(2), val: { marks: ['unknown'] } } }],
+    ['newer titleInput', { titleInput: { ver: 9, seq: SessionSeq(3), val: { firstSeq: 1, count: 1, lastSeq: 3 } } }],
+  ]
+
+  it.each(preservationCases)('removes the obsolete v3 text row while preserving the %s row and record identity', async (_kind, preserved) => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-discard-'))
+    roots.push(root)
+    const id = SessionId(`preserve-${_kind.replaceAll(' ', '-')}`)
+    const rows: CheckpointRecord['rows'] = { titleInput: obsoleteTitleInput(), ...preserved }
+    await seedRecord(root, String(id), rows, identity)
+    const { cache } = await harness({ root })
+
+    await cache.discardObsoleteProjectionRows('titleInput', 4)
+
+    const stored = await storedRecord(root, id)
+    expect(stored?.identity).toEqual(identity)
+    expect(stored?.rows.titleInput).toEqual(preserved.titleInput)
+    for (const [key, row] of Object.entries(preserved)) expect(stored?.rows[key]).toEqual(row)
+    expect(await readFile(recordPath(root, id), 'utf8')).not.toContain(OLD_TEXT)
+    // The in-memory table changed with the medium.
+    const table = domainTable(cache)
+    expect(table.get(id)?.identity).toEqual(identity)
+    expect(table.get(id)?.rows.titleInput).toEqual(preserved.titleInput)
+  })
+
+  it('is idempotent after the obsolete row is gone', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-discard-'))
+    roots.push(root)
+    const id = SessionId('idempotent')
+    await seedRecord(root, String(id), { titleInput: obsoleteTitleInput() }, identity)
+    const { cache } = await harness({ root })
+
+    await cache.discardObsoleteProjectionRows('titleInput', 4)
+    const afterFirst = await readFile(recordPath(root, id), 'utf8')
+    await cache.discardObsoleteProjectionRows('titleInput', 4)
+
+    expect(await readFile(recordPath(root, id), 'utf8')).toBe(afterFirst)
+    expect((await storedRows(root, id))?.titleInput).toBeUndefined()
+  })
+
+  it.skipIf(process.platform === 'win32')('reports a durable write failure and keeps the old row (POSIX permissions)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-discard-'))
+    roots.push(root)
+    const id = SessionId('write-failure')
+    await seedRecord(root, String(id), { titleInput: obsoleteTitleInput() }, identity)
+    const { ctx, cache } = await harness({ root })
+    const table = domainTable(cache)
+    const before = table.get(id)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    const sessionsDir = join(root, projectionCacheDomainSpec.name, 'sessions')
+    await chmod(sessionsDir, 0o500)
+    try {
+      await cache.discardObsoleteProjectionRows('titleInput', 4)
+    } finally {
+      await chmod(sessionsDir, 0o700)
+    }
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('obsolete "titleInput" row cleanup'))
+    expect(table.get(id)).toEqual(before)
+    expect((await storedRecord(root, id))?.rows.titleInput?.ver).toBe(3)
+    expect(await readFile(recordPath(root, id), 'utf8')).toContain(OLD_TEXT)
+  })
+
+  it('rechecks inside the writer slot so a Session that became live keeps its new checkpoint', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-discard-'))
+    roots.push(root)
+    const id = SessionId('live-writer-slot')
+    await seedRecord(root, String(id), {
+      titleInput: obsoleteTitleInput(),
+      'cache-test/marks': { ver: 1, seq: SessionSeq(3), val: { marks: ['old'] } },
+    }, identity)
+    const { ctx, cache } = await harness({ root })
+    ctx.sessionProjections.register(titleInputUnit)
+    const table = domainTable(cache)
+
+    expect(table.get(id)?.rows.titleInput?.ver).toBe(3)
+    const write = cache.write.bind(cache)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const writes: Promise<void>[] = []
+    const heldWrites = vi.spyOn(cache, 'write').mockImplementation((session) => {
+      const pending = gate.then(() => write(session))
+      writes.push(pending)
+      return pending
+    })
+    try {
+      const cleanup = cache.discardObsoleteProjectionRows('titleInput', 4)
+      ctx.sessions.create(id)
+      await cleanup
+      expect((await storedRows(root, id))?.titleInput?.ver).toBe(3)
+      expect(table.get(id)?.rows.titleInput?.ver).toBe(3)
+
+      release()
+      await Promise.all(writes)
+      expect((await storedRows(root, id))?.titleInput)
+        .toMatchObject({ ver: 4, seq: -1, val: { firstSeq: null, count: 0, lastSeq: null } })
+      expect(await readFile(recordPath(root, id), 'utf8')).not.toContain(OLD_TEXT)
+      expect(table.get(id)?.rows.titleInput?.ver).toBe(4)
+    } finally {
+      release()
+      await Promise.all(writes)
+      heldWrites.mockRestore()
+    }
+  })
+
+  it('rejects a queued cleanup after cancellation without deleting the row', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-projcache-discard-'))
+    roots.push(root)
+    const id = SessionId('cancelled-slot')
+    await seedRecord(root, String(id), { titleInput: obsoleteTitleInput() }, identity)
+    const { cache } = await harness({ root })
+    const table = domainTable(cache)
+    const controller = new AbortController()
+
+    // Abort after the synchronous candidate scan, before the queued writer
+    // slot runs: the scheduled cleanup must not delete anything.
+    const cleanup = cache.discardObsoleteProjectionRows('titleInput', 4, controller.signal)
+    controller.abort(new Error('cleanup cancelled'))
+
+    await expect(cleanup).rejects.toThrow('cleanup cancelled')
+
+    expect((await storedRecord(root, id))?.rows.titleInput?.ver).toBe(3)
+    expect(table.get(id)?.rows.titleInput?.ver).toBe(3)
   })
 })

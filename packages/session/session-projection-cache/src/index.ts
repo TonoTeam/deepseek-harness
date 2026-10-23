@@ -30,6 +30,7 @@ import type {
   ProjectionCheckpoint,
   ProjectionSnapshot,
   SessionProjectionMap,
+  SessionProjectionStateMap,
 } from '@deepseek-ai/dsh-session-projection'
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
 import { projectionCacheDomainSpec } from './spec.ts'
@@ -188,6 +189,60 @@ export class SessionProjectionCache extends Service {
     const record = this.requireTable().get(meta.id)
     if (record === undefined || !predecessorIdentityMatches(record.identity, expected)) return undefined
     return this.viewRecord(record, [PREDECESSOR_TITLE_KEY])
+  }
+
+  /**
+   * Remove one expected projection row from every cold checkpoint record where
+   * its stored `ver` is older than `currentStateVersion`.
+   *
+   * Only the requested key changes: record identity, the exact title row,
+   * unknown keys, and rows at or newer than the current version are preserved.
+   * Live sessions are skipped by the initial scan and again inside the
+   * domain's writer slot, where the current record is inspected, so a
+   * checkpoint that became live or landed in between is not overwritten by a
+   * stale copy. Cancellation is checked at the same points. A durable write
+   * failure logs a warning and leaves both the stored record and the domain's
+   * in-memory value unchanged; the cache self-heals on the next checkpoint.
+   * Cancellation rejects with the signal's reason.
+   * @param key - the projection key whose obsolete rows are discarded.
+   * @param currentStateVersion - the live unit version; rows with a lower `ver` are obsolete.
+   * @param signal - optional cancellation, checked before each scan step and inside each writer slot.
+   * @returns after every matching cold record has been updated or reconciled.
+   */
+  async discardObsoleteProjectionRows(
+    key: Extract<keyof SessionProjectionStateMap, string>,
+    currentStateVersion: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted()
+    const table = this.requireTable()
+    const candidates: SessionId[] = []
+    for (const id of table.keys()) {
+      signal?.throwIfAborted()
+      if (this.ctx.sessions.get(id) !== undefined) continue
+      const row = table.get(id)?.rows[key]
+      if (row !== undefined && row.ver < currentStateVersion) candidates.push(id)
+    }
+    for (const id of candidates) {
+      signal?.throwIfAborted()
+      try {
+        // Recheck inside the existing writer slot: `current` is the record at
+        // this job's place on the domain write chain, not the precheck copy.
+        await table.update(id, (current) => {
+          signal?.throwIfAborted()
+          if (this.ctx.sessions.get(id) !== undefined) return current
+          const row = current.rows[key]
+          if (row === undefined || row.ver >= currentStateVersion) return current
+          const rows = Object.fromEntries(
+            Object.entries(current.rows).filter(([rowKey]) => rowKey !== key),
+          )
+          return { ...current, rows }
+        })
+      } catch (error: unknown) {
+        if (signal?.aborted === true) throw signal.reason
+        this.ctx.logger.warn(`session projection cache: obsolete "${String(key)}" row cleanup for "${id}" failed (cache stays stale): ${String(error)}`)
+      }
+    }
   }
 
   /**

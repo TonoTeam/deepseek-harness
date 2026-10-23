@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
-import type { Session, SessionSeq as SessionSeqType } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionSeq as SessionSeqType } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SessionTitleService from '@deepseek-ai/dsh-session-title'
 
@@ -92,9 +92,11 @@ describe('title projection unit', () => {
 
     const state = ctx.sessionProjections.stateOf(session, 'titleInput')
     expect(state?.count).toBe(5_000)
-    expect(state?.first?.text).toBe('message 0')
+    expect(state?.firstSeq).toBe(1)
     expect(state?.lastSeq).toBe(session.seq - 1)
-    expect(ctx.sessionProjections.checkpoint(session).titleInput).toBeDefined()
+    const checkpoint = ctx.sessionProjections.checkpoint(session)
+    expect(checkpoint.titleInput).toBeDefined()
+    expect(JSON.stringify(checkpoint.titleInput)).not.toContain('message 0')
   })
 
   it('rejects a version-matching checkpoint with inconsistent title input counters', async () => {
@@ -103,10 +105,10 @@ describe('title projection unit', () => {
     const row = checkpoint.titleInput
     expect(row).toBeDefined()
     const invalidStates = [
-      { first: null, count: 1, lastSeq: null },
-      { first: { seq: 1, text: 'first' }, count: 1, lastSeq: null },
-      { first: { seq: 1, text: 'first' }, count: 0, lastSeq: 1 },
-      { first: { seq: 2, text: 'first' }, count: 1, lastSeq: 1 },
+      { firstSeq: null, count: 1, lastSeq: null },
+      { firstSeq: 1, count: 1, lastSeq: null },
+      { firstSeq: 1, count: 0, lastSeq: 1 },
+      { firstSeq: 2, count: 1, lastSeq: 1 },
     ]
     for (const state of invalidStates) {
       const malformed = {
@@ -123,8 +125,50 @@ describe('title projection unit', () => {
       ...checkpoint,
       titleInput: {
         ...row!,
-        val: { first: { seq: 1, text: 'first' }, count: 1, lastSeq: 1 },
+        val: { firstSeq: 1, count: 1, lastSeq: 1 },
       },
     }, [], SessionLogOffset(0), session.header, session.inheritedEventCount)).not.toThrow()
+  })
+
+  it('refolds a version-3 title input row from the log without retaining its text', async () => {
+    const { ctx, session } = await harness(true)
+    const message = session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'legacy title text' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    const checkpoint = ctx.sessionProjections.checkpoint(session)
+    const legacy = {
+      ...checkpoint,
+      titleInput: {
+        ...checkpoint.titleInput!,
+        ver: 3,
+        val: {
+          first: { seq: message.seq, text: 'legacy title text' },
+          count: 1,
+          lastSeq: message.seq,
+        },
+      },
+    }
+
+    // A version-3 row is unusable at v4; restore refolds the full log into the
+    // reference-only checkpoint rather than migrating the stored text.
+    const log: SessionEvent[] = []
+    for (let seq = 0; seq < session.seq; seq += 1) {
+      const event = await ctx.sessions.readEvent(session, SessionSeq(seq))
+      if (event !== undefined) log.push(event)
+    }
+    const restored = ctx.sessionProjections.restore(
+      legacy,
+      log,
+      SessionLogOffset(0),
+      session.header,
+      session.inheritedEventCount,
+    )
+    expect(restored.checkpoint.titleInput?.val).toEqual({
+      firstSeq: message.seq,
+      count: 1,
+      lastSeq: message.seq,
+    })
+    expect(JSON.stringify(restored.checkpoint.titleInput)).not.toContain('legacy title text')
   })
 })

@@ -1284,6 +1284,62 @@ describe('SessionStore', () => {
     expect(ctx.sessions.list()).toEqual([session])
   })
 
+  it('reads one exact frozen live event, including inherited fork history and an unflushed append', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    const parent = ctx.sessions.create(SessionId('read-event-parent'))
+    const inherited = parent.append('turn/start', { turn: 1 })
+    const child = ctx.sessions.fork(parent, undefined, SessionId('read-event-child'))
+    const inheritedEvent = await ctx.sessions.readEvent(child, inherited.seq)
+    expect(inheritedEvent).toBeDefined()
+
+    // The inherited prefix keeps its source seq and resolves from the child's
+    // own live log without reading persistence.
+    const returned = await ctx.sessions.readEvent(child, inherited.seq)
+    expect(returned).toBe(inheritedEvent)
+    expect(Object.isFrozen(returned)).toBe(true)
+
+    // The append is live but not flushed; the read returns the exact event
+    // object already stored in the log.
+    const unflushed = parent.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'live unflushed event' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    await expect(ctx.sessions.readEvent(parent, unflushed.seq)).resolves.toBe(unflushed)
+
+    await expect(ctx.sessions.readEvent(parent, SessionSeq(9_999))).resolves.toBeUndefined()
+  })
+
+  it('rejects a non-live Session before and after the async boundary, and honors cancellation', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    const session = ctx.sessions.create(SessionId('read-event-live'))
+    session.append('turn/start', { turn: 1 })
+
+    const disposed = ctx.sessions.prepare(SessionId('read-event-disposed'))
+    const detach = ctx.sessions.enter(disposed)
+    ctx.sessions.announce(disposed)
+    disposed.append('turn/start', { turn: 1 })
+    const pending = ctx.sessions.readEvent(disposed, SessionSeq(0))
+    detach()
+    await expect(pending).rejects.toThrow('not live in this store')
+
+    const otherCtx = new Context()
+    await otherCtx.plugin(SessionStore)
+    await expect(otherCtx.sessions.readEvent(session, SessionSeq(0)))
+      .rejects.toThrow('not live in this store')
+
+    const preCancelled = new AbortController()
+    preCancelled.abort(new Error('pre-cancelled read'))
+    await expect(ctx.sessions.readEvent(session, SessionSeq(0), { signal: preCancelled.signal }))
+      .rejects.toThrow('pre-cancelled read')
+
+    const postCancelled = new AbortController()
+    const reading = ctx.sessions.readEvent(session, SessionSeq(0), { signal: postCancelled.signal })
+    postCancelled.abort(new Error('post-cancelled read'))
+    await expect(reading).rejects.toThrow('post-cancelled read')
+  })
+
   it('rejects duplicate ids and supports seeding', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
