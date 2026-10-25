@@ -110,6 +110,7 @@ class FactoryOwnership {
   private readonly inactive = Promise.withResolvers<void>()
   private readonly liveAgents = new Set<() => Promise<void>>()
   private startupTasks = new Set<Promise<void>>()
+  private cleanupFailed = false
 
   constructor(private readonly fiber: Context['fiber']) {}
 
@@ -120,6 +121,16 @@ class FactoryOwnership {
 
   isActive(): boolean {
     return this.accepting && !INACTIVE_STATES.has(this.fiber.state)
+  }
+
+  latchCleanupFailure(): void {
+    this.cleanupFailed = true
+  }
+
+  isQuiescent(): boolean {
+    if (!this.isActive() || this.cleanupFailed) return false
+    // Config startup and public create/resume continuations share startupTasks.
+    return this.startupTasks.size === 0 && this.liveAgents.size === 0
   }
 
   /** Track one live agent's shared teardown until it has run. */
@@ -135,9 +146,25 @@ class FactoryOwnership {
     void job.then(forget, forget)
   }
 
-  /** Join one public create/resume continuation; factory dispose awaits its settlement. */
-  trackWrapper(job: Promise<unknown>): void {
-    this.trackStartup(job.then(() => undefined, () => undefined))
+  runStartup<T>(operation: () => Promise<T>): Promise<T> {
+    const marker = Promise.withResolvers<void>()
+    this.startupTasks.add(marker.promise)
+    let running: Promise<T>
+    try {
+      running = operation()
+    } catch (error: unknown) {
+      this.startupTasks.delete(marker.promise)
+      marker.resolve()
+      throw error
+    }
+    return running.finally(() => {
+      this.startupTasks.delete(marker.promise)
+      marker.resolve()
+    })
+  }
+
+  trackAbandoned(job: Promise<void>): void {
+    this.trackStartup(Promise.race([job, this.inactive.promise]))
   }
 
   /** Resolve `task`, or stop waiting when factory teardown begins. */
@@ -155,7 +182,10 @@ class FactoryOwnership {
     ])
     const failures: unknown[] = []
     for (const result of settlements) {
-      if (result.status === 'rejected') failures.push(result.reason)
+      if (result.status === 'rejected') {
+        this.latchCleanupFailure()
+        failures.push(result.reason)
+      }
     }
     throwCollectedFailures(failures, 'agent loop disposal failed')
   }
@@ -177,12 +207,17 @@ async function raceAbort<T>(operation: PromiseLike<T> | T, signal: AbortSignal, 
   }
 }
 
-/** Start an abortable operation and release a value that arrives after cancellation. */
+/**
+ * Start an abortable operation, release a value that arrives after
+ * cancellation, and optionally join that abandonment continuation to its
+ * lifecycle owner until cleanup finishes.
+ */
 async function raceAbortCall<T>(
   operation: () => PromiseLike<T> | T,
   signal: AbortSignal,
   id: SessionId,
-  releaseAbandoned?: (value: T) => void,
+  releaseAbandoned?: (value: T) => Promise<void> | void,
+  trackAbandoned?: (job: Promise<void>) => void,
 ): Promise<T> {
   if (signal.aborted) {
     throw signal.reason instanceof Error
@@ -195,7 +230,15 @@ async function raceAbortCall<T>(
   } catch (error: unknown) {
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- the signal can abort while the operation is awaited.
     if (signal.aborted && releaseAbandoned !== undefined) {
-      void pending.then(releaseAbandoned, () => undefined)
+      // The release starts only when the abandoned operation settles. Keep
+      // that whole continuation observable and, when its owner asks, joined
+      // to the lifecycle's quiescence ledger until cleanup finishes.
+      const cleanup = pending.then(
+        value => releaseAbandoned(value),
+        () => undefined,
+      )
+      if (trackAbandoned === undefined) void cleanup.catch(() => {})
+      else trackAbandoned(cleanup)
     }
     throw error
   }
@@ -424,6 +467,19 @@ export class AgentLoop extends Service implements AgentFactory {
     }
   }
 
+  /**
+   * Prove that this factory owns no Agent lifecycle work. The agent registry's
+   * `tryRunWhenIdle` calls it before a synchronous process-idle callback: the
+   * proof covers factory activity, config startup and public create/resume
+   * continuations, every live or draining Agent teardown, and a latched unknown
+   * cleanup failure. Synchronous and side-effect free; it performs no allocator
+   * or native memory operation.
+   * @returns true only while every owned lifecycle has reached complete cleanup.
+   */
+  isQuiescent(): boolean {
+    return this.ownership.isQuiescent()
+  }
+
   /** Report a contained declarative-start failure to identity-bound consumers. */
   private reportConfiguredStartupFailure(
     configId: string,
@@ -519,6 +575,7 @@ export class AgentLoop extends Service implements AgentFactory {
         : new Error(`agent "${id}" creation aborted`, { cause: callerSignal.reason })
     }
     const loopCtx = this.runtime.ctx
+    const ownership = this.ownership
 
     // Deactivation fuses three owners, each with its own reason: the caller's
     // cancellation signal, the owner fiber's unload, and factory teardown.
@@ -554,6 +611,10 @@ export class AgentLoop extends Service implements AgentFactory {
       // and ownership cleanup always run to quiescence, then the memoized
       // disposal rejects with what failed so every racing owner observes it.
       const failures: unknown[] = []
+      const collectFailure = (error: unknown): void => {
+        this.ownership.latchCleanupFailure()
+        failures.push(error)
+      }
       try {
         // Creation listeners retain the session and scope through their awaits.
         if (publication !== undefined) await publication.promise
@@ -568,12 +629,12 @@ export class AgentLoop extends Service implements AgentFactory {
           await machine.whenIdle()
         }
       } catch (error: unknown) {
-        failures.push(error)
+        collectFailure(error)
       }
       try {
         await machine?.scope.dispose()
       } catch (error: unknown) {
-        failures.push(error)
+        collectFailure(error)
       }
       // Close drains events already routed into the handle. The backend's
       // live-event listeners must stay mounted through driver shutdown to
@@ -582,13 +643,17 @@ export class AgentLoop extends Service implements AgentFactory {
       try {
         await handle?.close()
       } catch (error: unknown) {
-        failures.push(error)
+        collectFailure(error)
       }
       try {
         detachAgent?.()
+      } catch (error: unknown) {
+        collectFailure(error)
+      }
+      try {
         detachSession?.()
-      } finally {
-        untrack()
+      } catch (error: unknown) {
+        collectFailure(error)
       }
       throwCollectedFailures(failures, `agent "${id}" disposal failed`)
     })())
@@ -597,11 +662,32 @@ export class AgentLoop extends Service implements AgentFactory {
     const dispose = async (): Promise<void> => {
       try {
         await teardown()
+      } catch (error: unknown) {
+        this.ownership.latchCleanupFailure()
+        throw error
       } finally {
-        await Promise.all([unfollowOwner(), unfollowScope?.()])
+        try {
+          await Promise.all([unfollowOwner(), unfollowScope?.()])
+        } catch (error: unknown) {
+          // Detaching the lifecycle effects is part of complete cleanup; a
+          // failure leaves an unknown residue and refuses later quiescence.
+          this.ownership.latchCleanupFailure()
+          throw error
+        } finally {
+          // Keep the lifecycle tracked through follow cleanup: a synchronous
+          // idle proof must never observe the Agent as quiescent while a
+          // deferred teardown effect is still settling.
+          untrack()
+        }
       }
     }
     const untrack = this.ownership.track(dispose)
+    const finishTeardown = (): Promise<void> => teardown()
+      .catch((error: unknown) => {
+        ownership.latchCleanupFailure()
+        throw error
+      })
+      .finally(() => { untrack() })
     try {
       unfollowOwner = ownerCtx.effect(function* () {
         const created = machine = new ReactLoopAgent(loopCtx, id, options, session)
@@ -611,15 +697,28 @@ export class AgentLoop extends Service implements AgentFactory {
         if (!INACTIVE_STATES.has(loopCtx.fiber.state)) {
           unfollowScope = loopCtx.effect(function* () {
             yield created.scope.rawDispose
-            yield () => teardown()
+            yield () => finishTeardown()
           }, `agentLoop.scope(${id})`)
         }
         yield async () => {
           abort.abort(new Error(`agent "${id}" setup aborted: owner disposed during setup`))
           try {
             await teardown()
+          } catch (error: unknown) {
+            // Latch before the final untrack even for an unexpected teardown
+            // failure; collected failures already latched inside teardown().
+            ownership.latchCleanupFailure()
+            throw error
           } finally {
-            await unfollowScope?.()
+            try {
+              await unfollowScope?.()
+            } catch (error: unknown) {
+              // Detaching the adopted scope effect is part of complete cleanup.
+              ownership.latchCleanupFailure()
+              throw error
+            } finally {
+              untrack()
+            }
           }
         }
       }, `agentLoop.lifecycle(${id})`)
@@ -751,7 +850,9 @@ export class AgentLoop extends Service implements AgentFactory {
             detachSession = agent.ctx.sessions.enter(session)
             // The mounted backend routes announced live events into the active
             // write handle by session id; the loop only owns the handle itself.
-            detachAgent = loopCtx.agents.enter(agent, parentAgent)
+            // This exact factory's ownership ledger covers the Agent through
+            // complete cleanup, so the registry keeps its idle proof.
+            detachAgent = loopCtx.agents.enter(agent, parentAgent, this)
             agent.ctx.sessions.announce(session)
             assertLive()
             await loopCtx.agents.announce(agent, source, abort.signal)
@@ -767,8 +868,7 @@ export class AgentLoop extends Service implements AgentFactory {
       }
     } catch (error: unknown) {
       machineReady.resolve()
-      // Rollback swallows a disposal rejection: the setup failure is primary.
-      void dispose().catch(() => {})
+      void dispose().catch(() => { this.ownership.latchCleanupFailure() })
       throw error
     }
   }
@@ -784,19 +884,31 @@ export class AgentLoop extends Service implements AgentFactory {
    * @returns the published running agent.
    */
   async create(id: SessionId, options: AgentOptions = {}, meta: Pick<SessionHeader, 'cwd'> = {}): Promise<Agent> {
-    using preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, { meta }))
-    const stored = await this.createStoredSession(preparation.session)
-    let prepared: PreparedAgent
-    try {
-      prepared = this.prepare(this.ctx, id, options, preparation.session, undefined, stored?.handle)
-    } catch (error: unknown) {
-      await stored?.handle.close().catch(() => {})
-      throw error
-    }
-    return (await this.initializeAgent(prepared, async () => {
-      await this.appendUnstoredSuffix(stored, preparation.session)
-      return await prepared.publish('startup')
-    })).agent
+    return await this.ownership.runStartup(async () => {
+      using preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(id, { meta }))
+      const stored = this.runtime.ctx.get('sessionPersistence') === undefined
+        ? await this.createStoredSession(preparation.session)
+        : await raceAbortCall(
+          () => this.createStoredSession(preparation.session, this.ownership.signal),
+          this.ownership.signal,
+          id,
+          value => value?.handle.close(),
+          (job) => { this.trackAbandonedCleanup(job) },
+        )
+      let prepared: PreparedAgent
+      try {
+        prepared = this.prepare(this.ctx, id, options, preparation.session, undefined, stored?.handle)
+      } catch (error: unknown) {
+        // A close failure leaves durability unknown; latch it fail-closed while
+        // preserving the primary prepare failure.
+        await stored?.handle.close().catch(() => { this.ownership.latchCleanupFailure() })
+        throw error
+      }
+      return (await this.initializeAgent(prepared, async () => {
+        await this.appendUnstoredSuffix(stored, preparation.session)
+        return await prepared.publish('startup')
+      })).agent
+    })
   }
 
   /**
@@ -818,6 +930,20 @@ export class AgentLoop extends Service implements AgentFactory {
       ...signal === undefined ? {} : { signal },
     })
     return { handle, storedCount: 0 }
+  }
+
+  /**
+   * Join one caller-abandoned cleanup continuation to factory ownership until
+   * it settles. A rejected cleanup leaves an unknown durability outcome, so it
+   * latches quiescence fail-closed instead of becoming an unhandled rejection.
+   * @param job - abandoned cleanup whose completion the factory owns.
+   */
+  private trackAbandonedCleanup(job: Promise<void>): void {
+    const settled = job.then(
+      () => undefined,
+      () => { this.ownership.latchCleanupFailure() },
+    )
+    this.ownership.trackAbandoned(settled)
   }
 
   /**
@@ -846,12 +972,12 @@ export class AgentLoop extends Service implements AgentFactory {
    * @returns the published handle.
    */
   async createAgent(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle> {
-    const preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(options.sessionId, {
-      ...options.seed === undefined ? {} : { seed: options.seed },
-      ...options.meta === undefined ? {} : { meta: options.meta },
-      ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
-    }))
-    const published = (async () => {
+    return await this.ownership.runStartup(async () => {
+      const preparation = SessionPreparation.create(this.runtime.ctx.sessions.prepare(options.sessionId, {
+        ...options.seed === undefined ? {} : { seed: options.seed },
+        ...options.meta === undefined ? {} : { meta: options.meta },
+        ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
+      }))
       let stored: StoredSession | undefined
       try {
         // raceAbortCall normalizes a pre-aborted or mid-create abort and
@@ -862,13 +988,14 @@ export class AgentLoop extends Service implements AgentFactory {
             () => this.createStoredSession(preparation.session, options.signal),
             options.signal,
             options.sessionId,
-            (abandoned) => { void abandoned?.handle.close().catch(() => {}) },
+            abandoned => abandoned?.handle.close(),
+            (job) => { this.trackAbandonedCleanup(job) },
           )
       } catch (error: unknown) {
         preparation[Symbol.dispose]()
         throw error
       }
-      return this.setupAndPublish(
+      return await this.setupAndPublish(
         ownerCtx,
         options.sessionId,
         preparation,
@@ -879,9 +1006,7 @@ export class AgentLoop extends Service implements AgentFactory {
         stored,
         options.parentAgent,
       )
-    })()
-    this.ownership.trackWrapper(published)
-    return published
+    })
   }
 
   /** Prepare one Agent around an acquired Session, run setup, and publish it. */
@@ -902,7 +1027,9 @@ export class AgentLoop extends Service implements AgentFactory {
     try {
       prepared = this.prepare(ownerCtx, id, agentOptions, session, signal, stored?.handle, parentAgent)
     } catch (error: unknown) {
-      await stored?.handle.close().catch(() => {})
+      // A close failure leaves durability unknown; latch it fail-closed while
+      // preserving the primary prepare failure.
+      await stored?.handle.close().catch(() => { this.ownership.latchCleanupFailure() })
       throw error
     }
     return await this.initializeAgent(prepared, async () => {
@@ -926,8 +1053,9 @@ export class AgentLoop extends Service implements AgentFactory {
       })
     } catch (error: unknown) {
       // Rollback swallows a disposal rejection (a failing final handle close):
-      // the setup failure is the primary error the caller must see.
-      await prepared.dispose().catch(() => {})
+      // the setup failure is the primary error the caller must see. The
+      // rejection still latches an unknown cleanup outcome fail-closed.
+      await prepared.dispose().catch(() => { this.ownership.latchCleanupFailure() })
       throw error
     }
   }
@@ -952,8 +1080,8 @@ export class AgentLoop extends Service implements AgentFactory {
     persistence: SessionPersistence,
     options: ResumeAgentOptions,
   ): Promise<AgentHandle> {
-    const id = options.resumeSessionId
-    const published = (async () => {
+    return this.ownership.runStartup(async () => {
+      const id = options.resumeSessionId
       // The open and read may outlive their owner: race them against caller
       // cancellation, owner-fiber unload, and factory teardown so a
       // never-settling backend cannot pin the identity.
@@ -977,7 +1105,8 @@ export class AgentLoop extends Service implements AgentFactory {
             () => persistence.open(id, 'write', { signal: fused }),
             fused,
             id,
-            (abandoned) => { void abandoned.close() },
+            abandoned => abandoned.close(),
+            (job) => { this.trackAbandonedCleanup(job) },
           )
           // Semantic crash repair is the agent layer's job: persistence hands
           // back the physically valid log; an interrupted final turn receives
@@ -997,7 +1126,14 @@ export class AgentLoop extends Service implements AgentFactory {
           stored = { handle, storedCount: persisted.length + closers.length }
           await this.appendUnstoredSuffix(stored, preparation.session)
         } finally {
-          await unfollowOwner()
+          try {
+            await unfollowOwner()
+          } catch (error: unknown) {
+            // A failing owner-disposal effect leaves an unknown cleanup
+            // residue; the factory can no longer prove quiescence.
+            this.ownership.latchCleanupFailure()
+            throw error
+          }
         }
         ownerCtx.fiber.assertActive()
         if (!this.ownership.isActive()) throw new Error('agent loop is not active')
@@ -1016,11 +1152,11 @@ export class AgentLoop extends Service implements AgentFactory {
         )
       } finally {
         preparation?.[Symbol.dispose]()
-        await handle?.close().catch(() => {})
+        // A failed close leaves durability unknown; latch it without masking
+        // the primary resume failure.
+        await handle?.close().catch(() => { this.ownership.latchCleanupFailure() })
       }
-    })()
-    this.ownership.trackWrapper(published)
-    return published
+    })
   }
 }
 

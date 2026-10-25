@@ -254,6 +254,76 @@ describe('LocalJobRegistry.start', () => {
     for (const job of live) job.settle({ status: 'completed' })
   })
 
+  it('refuses a synchronous starter re-entry and admits a confirmed completion', async () => {
+    const ctx = await harness()
+    expect(ctx.jobs.isProcessIdle()).toBe(true)
+    let rowsDuringStart = -1
+    let idleDuringStart: boolean | undefined
+    let settle!: (outcome: JobOutcome) => void
+    ctx.jobs.start({
+      kind: 'bash',
+      label: 'synchronous start',
+      run: () => {
+        rowsDuringStart = ctx.jobs.list().length
+        idleDuringStart = ctx.jobs.isProcessIdle()
+        return {
+          cancel() {},
+          done: new Promise<JobOutcome>((resolve) => { settle = resolve }),
+        }
+      },
+    })
+
+    // The public start counts at entry, before the producer can observe the
+    // registry; the registration record does not exist yet.
+    expect(rowsDuringStart).toBe(0)
+    expect(idleDuringStart).toBe(false)
+    expect(ctx.jobs.isProcessIdle()).toBe(false)
+
+    settle({ status: 'completed' })
+    await tick()
+    // A settled record with a confirmed producer report no longer blocks.
+    expect(ctx.jobs.isProcessIdle()).toBe(true)
+  })
+
+  it.each([
+    {
+      scenario: 'a throwing producer',
+      error: 'producer startup failed',
+      run: (): JobHooks => { throw new Error('producer startup failed') },
+    },
+    {
+      scenario: 'a cancel getter that throws',
+      error: 'cancel getter failed',
+      run: (): JobHooks => ({
+        get cancel(): () => void { throw new Error('cancel getter failed') },
+        done: new Promise<JobOutcome>(() => {}),
+      }),
+    },
+    {
+      scenario: 'a cancel binding that throws',
+      error: 'cancel binding failed',
+      run: (): JobHooks => {
+        const cancel = () => {}
+        Object.defineProperty(cancel, 'bind', {
+          value: () => { throw new Error('cancel binding failed') },
+        })
+        return { cancel, done: new Promise<JobOutcome>(() => {}) }
+      },
+    },
+  ] satisfies { scenario: string; error: string; run: JobSpec['run'] }[])(
+    'preserves the original throw for $scenario and refuses idle',
+    async ({ error, run }) => {
+      const ctx = await harness()
+      try {
+        expect(() => ctx.jobs.start({ kind: 'bash', label: 'uncommitted start', run })).toThrow(error)
+        expect(ctx.jobs.list()).toEqual([])
+        expect(ctx.jobs.isProcessIdle()).toBe(false)
+      } finally {
+        await ctx.fiber.dispose()
+      }
+    },
+  )
+
   it('rejects before producer start and id allocation, then admits immediately after settlement', async () => {
     const ctx = await harness({ maxConcurrentJobsPerOwner: 1 })
     const first = producer()
@@ -467,6 +537,7 @@ describe('LocalJobRegistry.kill', () => {
     expect(ctx.jobs.kill(id, undefined, 'no longer needed')).toBe('requested')
     expect(p.cancels).toEqual(['no longer needed'])
     expect(ctx.jobs.list()[0]).toMatchObject({ status: 'stopping' })
+    expect(ctx.jobs.isProcessIdle()).toBe(false)
     expect(seen).toMatchObject([{ type: 'stopping', job: { id, status: 'stopping' } }])
 
     p.settle({ status: 'killed', detail: 'signal: SIGTERM' })
@@ -1000,9 +1071,13 @@ describe('LocalJobRegistry disposal', () => {
       }),
     })
 
+    const jobs = ctx.jobs
     await fiber.dispose()
     expect(cancels).toEqual(['jobs service disposed'])
     expect(seen).toEqual(['registered', 'stopping', 'settled:teardown', 'output', 'removed'])
+    // Teardown is irreversible: the old instance refuses idle even after its
+    // records are gone.
+    expect(jobs.isProcessIdle()).toBe(false)
   })
 
   it('force-fails a throwing cancel so service disposal does not await producer done', async () => {
@@ -1601,6 +1676,12 @@ describe('owned job Session lifecycle records', () => {
     await ctx.jobs.wait(id, 1000, owner.id)
     expect(owner.session.snapshotEvents().find(event => event.type === 'job/settled')?.data)
       .toMatchObject({ status: 'failed', cause: 'producer', producerReported: false })
+    // The unknown cleanup latches before the terminal record and survives
+    // dropping that record.
+    expect(ctx.jobs.isProcessIdle()).toBe(false)
+    ctx.jobs.remove(id, owner.id)
+    expect(ctx.jobs.list(owner.id)).toEqual([])
+    expect(ctx.jobs.isProcessIdle()).toBe(false)
   })
 
   it('preserves a forced teardown record against late completion', async () => {
@@ -1614,6 +1695,9 @@ describe('owned job Session lifecycle records', () => {
     expect(events).toHaveLength(1)
     expect(events[0]?.data).toMatchObject({ status: 'failed', cause: 'teardown', producerReported: false })
     expect(ctx.jobs.list(owner.id)).toEqual([])
+    // A throwing teardown cancel forced the record terminal and the row is
+    // gone, but the producer never confirmed cleanup: the latch remains.
+    expect(ctx.jobs.isProcessIdle()).toBe(false)
   })
 
   it('keeps job identity distinct across fresh registries with the same owner', async () => {
@@ -1742,6 +1826,34 @@ describe('LocalJobRegistry owner retention', () => {
       expect(ctx.jobs.list(owner.id)).toEqual([])
       expect(ctx.agents.retention(owner)?.leases).toBe(0)
       expect(id).toBeTypeOf('string')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('refuses idle after a detached owner leaves a running job behind', async () => {
+    const ctx = await harness()
+    try {
+      const owner = stubAgent(ctx, 'detached-owner')
+      const detach = await ctx.agents.register(owner)
+      const p = producer({ owner })
+      const id = ctx.jobs.start(p.spec)
+      expect(ctx.agents.retention(owner)?.leases).toBe(1)
+      expect(ctx.jobs.isProcessIdle()).toBe(false)
+
+      // The register effect returns enter()'s single-shot detach. That valid
+      // capability removes the exact Agent entry even though this owned job
+      // holds a live lease, so an empty Agent registry is not a jobs-idle
+      // proof.
+      await detach()
+      expect(ctx.agents.get(owner.id)).toBeUndefined()
+      expect(ctx.agents.retention(owner)).toBeUndefined()
+      expect(ctx.jobs.get(id, owner.id).status).toBe('running')
+      expect(ctx.jobs.isProcessIdle()).toBe(false)
+
+      p.settle({ status: 'completed' })
+      await tick()
+      expect(ctx.jobs.isProcessIdle()).toBe(true)
     } finally {
       await ctx.fiber.dispose()
     }

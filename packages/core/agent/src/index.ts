@@ -320,6 +320,18 @@ export interface AgentFactory {
    * @returns the owned handle after setup, both announcements, and loop start complete.
    */
   resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle>
+  /**
+   * Positive, synchronous, side-effect-free proof that this factory owns no
+   * lifecycle the synchronous idle callback must exclude: no live or draining
+   * Agent teardown, no pending config startup or public create/resume
+   * continuation, and no latched unknown cleanup failure. The proof must not
+   * await, emit events, or invoke a service, because
+   * {@link AgentRegistry.tryRunWhenIdle} runs it in the same JavaScript call
+   * stack as the callback it admits. Omitting this method makes a custom
+   * factory unsupported by that registry check.
+   * @returns true only while the complete owned lifecycle is quiescent.
+   */
+  isQuiescent?(): boolean
 }
 
 /** Thrown when create/resume is called before an agent factory is registered. */
@@ -350,6 +362,8 @@ interface AgentEntry {
   /** Runtime creator-agent ownership; independent of durable session lineage. */
   readonly owner: Agent | undefined
   readonly carrier: Scoped<Agent>
+  /** True when the current registered factory owns this lifecycle through cleanup. */
+  readonly factoryOwned: boolean
   announced: boolean
   announcing: boolean
   detachRequested: boolean
@@ -366,6 +380,11 @@ interface InitiatorRun {
 /** Plain holder prevents Cordis from tracing the factory field before the caller context is known. */
 interface FactorySlot {
   readonly target: AgentFactory
+}
+
+/** Resolve a traced Cordis service to the concrete factory target it wraps. */
+function canonicalFactory(factory: AgentFactory): AgentFactory {
+  return (factory as AgentFactory & { [symbols.original]?: AgentFactory })[symbols.original] ?? factory
 }
 
 /**
@@ -385,6 +404,19 @@ export class AgentRegistry extends Service {
   /** Weak exact-instance record: detached and same-id-replaced Agents stay rejected without a retired map. */
   private readonly admissions = new WeakMap<Agent, AgentAdmission>()
   private factory: FactorySlot | undefined
+  /**
+   * Latched when this registry can no longer prove that no foreign or replaced
+   * lifecycle remains: a plain {@link enter}/{@link register} Agent detached,
+   * or the current factory registration was disposed. Idle callbacks stay
+   * refused for this registry's lifetime; a later factory cannot reset it.
+   */
+  private idleBlocked = false
+  /**
+   * Create/resume calls that have started and not settled. Incremented before
+   * the first await so a synchronous idle proof cannot observe a half-started
+   * factory call.
+   */
+  private pendingFactoryCalls = 0
   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
   private initiatorState: 'active' | 'closing' | 'disposed' = 'active'
@@ -491,7 +523,9 @@ export class AgentRegistry extends Service {
    * target; each create/resume call is then traced through that caller's
    * context so ownership follows the caller without stacking proxy layers.
    * Throws if a factory is already registered. Returns the disposer; on
-   * dispose the factory slot is cleared.
+   * dispose the factory slot is cleared and this registry permanently refuses
+   * idle callbacks, because the disposed factory's lifecycle ledger can no
+   * longer prove that its work is absent.
    * @param factory - the loop-owned factory {@link create}/{@link resume} delegate to.
    * @returns the disposer that clears the factory slot. The exact
    *   Cordis effect disposer (single-shot): composite (generator) effects may
@@ -503,9 +537,14 @@ export class AgentRegistry extends Service {
       // Avoid stacking two Cordis shadow layers when a caller passes a Service
       // already read through a context. Calls are re-traced through their
       // actual owner context below.
-      const target = (factory as AgentFactory & { [symbols.original]?: AgentFactory })[symbols.original] ?? factory
+      const target = canonicalFactory(factory)
       this.factory = { target }
-      return () => { this.factory = undefined }
+      return () => {
+        // The lifecycle ledger this factory proved is gone. A replacement
+        // registration cannot re-establish the disposed factory's proof.
+        this.idleBlocked = true
+        this.factory = undefined
+      }
     }, 'agents.setFactory()')
     // The exact cordis effect disposer (the agents.register() convention): a
     // caller's composite effect can yield it for in-order teardown; the
@@ -531,15 +570,20 @@ export class AgentRegistry extends Service {
    * @returns the handle after setup, rollback-covered publication, and loop start complete.
    */
   async create(options: CreateAgentOptions): Promise<AgentHandle> {
-    const ownerCtx = this.ctx
-    // Re-trace a Service-backed factory through the accessing context
-    // explicitly. This preserves AgentLoop's dependency origin while binding
-    // its effects to ownerCtx; plain factories receive ownerCtx as an explicit
-    // capability and need no Cordis tracker magic.
-    const { target } = this.requireFactory()
-    const receiver = getTraceable(ownerCtx, target)
-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
+    this.pendingFactoryCalls += 1
+    try {
+      const ownerCtx = this.ctx
+      // Re-trace a Service-backed factory through the accessing context
+      // explicitly. This preserves AgentLoop's dependency origin while binding
+      // its effects to ownerCtx; plain factories receive ownerCtx as an explicit
+      // capability and need no Cordis tracker magic.
+      const { target } = this.requireFactory()
+      const receiver = getTraceable(ownerCtx, target)
+      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+      return await Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
+    } finally {
+      this.pendingFactoryCalls -= 1
+    }
   }
 
   /**
@@ -550,11 +594,55 @@ export class AgentRegistry extends Service {
    * @returns the handle after setup, rollback-covered publication, and loop start complete.
    */
   async resume(options: ResumeAgentOptions): Promise<AgentHandle> {
-    const ownerCtx = this.ctx
-    const { target } = this.requireFactory()
-    const receiver = getTraceable(ownerCtx, target)
-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.resume, receiver, [ownerCtx, options])
+    this.pendingFactoryCalls += 1
+    try {
+      const ownerCtx = this.ctx
+      const { target } = this.requireFactory()
+      const receiver = getTraceable(ownerCtx, target)
+      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+      return await Reflect.apply(target.resume, receiver, [ownerCtx, options])
+    } finally {
+      this.pendingFactoryCalls -= 1
+    }
+  }
+
+  /**
+   * Run one synchronous operation only when this process owns no Agent
+   * lifecycle. The proof requires an active initiator scope, no live registry
+   * entry of any origin, no pending {@link create}/{@link resume}, no active
+   * initiator boundary, and a registered factory whose
+   * {@link AgentFactory.isQuiescent} proof is present and true. Every check,
+   * the proof, and `operation` execute in one JavaScript call stack with no
+   * await, event dispatch, service call, or log between them.
+   *
+   * The check never evicts, cancels, seals, or disposes an Agent; it only
+   * observes registry and factory state. A missing factory, a factory without
+   * the proof, or a false proof returns `false` without invoking `operation`.
+   * A proof or callback error propagates; a failed proof never invokes the
+   * callback. The registry permanently refuses after a plain
+   * {@link enter}/{@link register} Agent detaches or the current factory
+   * registration is disposed, because neither leaves a lifecycle ledger that
+   * can prove the remaining work absent.
+   * @param operation - synchronous side-effect callback invoked only after a passing proof.
+   * @returns true when `operation` ran; false when this process is busy or cannot prove quiescence.
+   * @throws when the factory proof or `operation` throws.
+   */
+  tryRunWhenIdle(operation: () => undefined): boolean {
+    if (this.idleBlocked) return false
+    if (this.initiatorState !== 'active') return false
+    if (this.store.size !== 0) return false
+    if (this.pendingFactoryCalls !== 0) return false
+    if (this.activeInitiatorRuns !== 0) return false
+    const factory = this.factory
+    if (factory === undefined) return false
+    if (factory.target.isQuiescent?.() !== true) return false
+    if (this.idleBlocked || this.factory !== factory) return false
+    if (this.initiatorState !== 'active') return false
+    if (this.store.size !== 0) return false
+    if (this.pendingFactoryCalls !== 0) return false
+    if (this.activeInitiatorRuns !== 0) return false
+    operation()
+    return true
   }
 
   /**
@@ -593,16 +681,29 @@ export class AgentRegistry extends Service {
    * @param owner - explicitly supplied live runtime owner, or
    *   undefined for a top-level runtime root. This is runtime ownership, not
    *   the resumed session's durable parent lineage.
+   * @param factory - optional exact current factory whose ledger covers this
+   *   lifecycle through complete cleanup. Supplying a different factory than
+   *   the registered one throws before any registry state changes. Omitting it
+   *   is a plain entry: the first accepted detach permanently refuses this
+   *   registry's idle callbacks because no factory ledger covers the Agent's
+   *   remaining work.
    * @returns an idempotent closure that removes this exact entry and emits
    *   `agent/disposed` with listener failures contained. When called from a
    *   `agent/created` listener, removal and disposal wait until the serial
    *   creation dispatch settles.
+   * @throws when the id mismatches the session, the id is already registered,
+   *   or a supplied factory is not the registered factory.
    */
-  enter(agent: Agent, owner: Agent | undefined): () => void {
+  enter(agent: Agent, owner: Agent | undefined, factory?: AgentFactory): () => void {
     const id = agent.id
     if (id !== agent.session.id) {
       throw new Error(`agent id "${id}" does not match session id "${agent.session.id}"`)
     }
+    const registered = this.factory
+    if (factory !== undefined && canonicalFactory(factory) !== registered?.target) {
+      throw new Error(`agent "${id}" was entered with a factory that is not the registered factory`)
+    }
+    const factoryOwned = factory !== undefined
     const carrier = scopeTarget(agent, agent)
     // This is the authoritative collision boundary. Concurrent create/resume
     // operations may both prepare, but only one exact entry can publish.
@@ -619,6 +720,7 @@ export class AgentRegistry extends Service {
       agent,
       owner,
       carrier,
+      factoryOwned,
       announced: false,
       announcing: false,
       detachRequested: false,
@@ -630,6 +732,10 @@ export class AgentRegistry extends Service {
     const detach = (): void => {
       if (!entered) return
       entered = false
+      // A plain entry has no factory ledger covering its remaining work, so
+      // its first accepted detach withdraws registry idle proof immediately,
+      // before a deferred announcement can hide the lifecycle.
+      if (!entry.factoryOwned) this.idleBlocked = true
       // Every callback reached by this creation dispatch must observe the same
       // live entry, and disposal must follow creation. A listener may own
       // the advanced detach capability, so make that ordering structural:

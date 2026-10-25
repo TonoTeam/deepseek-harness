@@ -62,6 +62,10 @@ kind: "package-reference"
 
 原生循环的句柄还暴露可选的 `reclaim` 拥有者能力。`idleSince()` 从最近的 idle 阶段、inbox 变更或使用租约释放起报告真实静止，并在运行轮次、维护、待处理 inbox 输入与尚未完成的发布期间不报告。`tryReclaim(check, { signal, timeoutMs })` 同步封口准入，在封口下运行调用方有界的后台活动检查，要求一次真实参与的持久化 flush，然后才调用常规拆除；`signal`/`timeoutMs` 让拥有者约束挂起的检查或 flush，而不会让准入永久封口。检查被拒、flush 失败或与拆除竞态都会中止封口并保留同一个实时 Agent，而封口期间新的 `send`/`inject`/inbox splice 输入会以 `AgentReclaimingError` 拒绝。未知的拆除结果会隔离身份并抛出 `AgentReclaimTeardownError`，供拥有者上报且不得自动恢复或替换。除非部署策略显式启用，没有调用方会使用该能力。
 
+原生循环还实现 `ctx.agents.tryRunWhenIdle()` 使用的可选 `AgentFactory.isQuiescent()` 证明。仅当循环活跃、配置启动与公开工厂续体已结算、每个实时 Agent 的 teardown 已达完整清理（含作用域与会话句柄清理），且没有 teardown、回滚或废弃会话句柄 close 失败被锁存时，它才为真。该证明同步且无副作用，不执行任何分配器或原生内存操作，也不改变任何模型可见请求、会话事件、持久化字段或 SDK/UI 行为。在发布、回滚或异步清理期间重入调用的回调会被拒绝，因为生命周期会留在所有权账本中直到清理结算。平台绑定与裁剪策略由提供方拥有；循环只报告生命周期状态。
+
+`AgentLoop.create()` 会在准备会话及调用持久化后端前登记启动过程。配置了持久化后，工厂关闭会取消句柄获取，迟到的句柄由既有清理账本关闭。未配置持久化时，配置启动保持原有完成时机。
+
 ```text
 const handle = await ctx.agents.create({
   sessionId,
@@ -110,6 +114,8 @@ const handle = await ctx.agents.create({
 ### 创建与拆除
 
 创建是同一个受回滚保护的事务：构造私有会话、具象 agent 与带作用域上下文；等待可选 setup；进入两个注册表；宣告 `session/created`；等待串行 `agent/created` 监听器；随后释放已排队输入。创建运行时子 Agent 的调用方设置 `options.parentAgent`；调用方 Context 则单独拥有事务和存活句柄。Setup、commit、监听器失败或所有者 dispose 都会回滚已准备的资源。已送达的宣告仍可被观察，并有配对的销毁通知。Teardown 停止并排空驱动器、撤销作用域、关闭会话写路径、detach agent，再 detach 会话。每次 detach 都绑定到确切进入的对象，因此陈旧 disposer 无法移除之后出现的同 id 替代项。
+
+Teardown 失败、回滚清理失败与废弃会话句柄 close 失败会把工厂的 `isQuiescent()` 证明锁存为失败关闭（fail-closed），而回滚清理成功的 setup 失败不会锁存。废弃的 close 在结算或工厂拆除之前始终是受跟踪的工厂续体。实时 Agent 会留在所有权账本中直到其 follow-effect detach 完成，而不只在注册表与会话句柄 teardown 期间。
 
 工厂卸载时在整个作用域清理期间保留 inbox 投影与轮次边界投影，包括作用域内 abort 监听器发起取消的时刻，直到所有 Agent teardown 和启动任务结束。清理失败不会使这些投影提前释放。调用方卸载、工厂卸载和句柄释放等待同一次 teardown。
 
@@ -216,6 +222,7 @@ const handle = await ctx.agents.create({
 
 - **分类是一元的**：安全性取决于比较同级调用或资源的调用必须保持独占（[原理](../../../.agents/notes/implemented/feature/2026-07-10-parallel-tool-call-execution.zh.md)）。
 - **根上下文关停的持久化**：存在活跃 Agent 时，关停根上下文可能使最终的 `turn/end` 仅留在内存中，未写入持久化日志。Agent teardown 完成不保证该事件已保存。
+- **未知清理失败会永久拒绝空闲静止**：在 teardown、回滚或废弃句柄 close 失败之后，`isQuiescent()` 在插件剩余生命周期内保持 false；其所属 `AgentRegistry` 也必须重建，因为释放工厂注册会锁存该注册表。
 - **此前已关闭的不一致历史**：失败步骤恢复不会改写已关闭历史轮次中尚无结果的调用。
 - **配置标签默认对应新会话**：省略 `sessionId` 时，每次启动都会创建新的 `${id}-session-<uuid>`；如需确切的恢复或创建行为，必须显式提供稳定的 `sessionId`，而 `resumeSessionId` 要求已有持久化历史。
 - **配置 agent 没有逐 agent persona 字段或 setup 钩子**：它们使用部署 persona；只有编程式 `ctx.agents.create()` / `resume()` 工厂选项支持带作用域的 persona 与工具组合。

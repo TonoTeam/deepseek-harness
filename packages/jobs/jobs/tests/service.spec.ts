@@ -88,6 +88,9 @@ describe('JobRegistry seam', () => {
     expect(id).toBe('bash-1')
 
     const jobs = ctx.jobs
+    // The seam default refuses: a provider that does not override the proof is
+    // never treated as idle.
+    expect(jobs.isProcessIdle()).toBe(false)
     expect(jobs.list(caller)).toHaveLength(1)
     expect(jobs.get(id, caller).status).toBe('running')
     expect(jobs.get(id, caller).owner).toBe(caller)

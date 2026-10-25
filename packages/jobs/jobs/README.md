@@ -43,6 +43,12 @@ A job belongs to the agent session that started it: another agent cannot read or
 
 A producer can start work only while a controller that serves the owner is attached — loading `dsh-tool-jobs` attaches one. An agent whose composition loads no controller cannot start background work; `start()` fails with a message that names the missing controller rather than starting work the agent could never collect or stop.
 
+### Reporting idle readiness
+
+A provider that may reclaim the process while no user work runs asks `ctx.jobs.isProcessIdle()`. The answer is a synchronous, read-only proof of readiness, not a listing: `true` means this registry accounts for every local producer it serves and no work is in flight; `false` means busy, unsupported, or unknown, and a caller must not act on it as idle. The abstract contract defaults to `false`, so an implementation that cannot prove the property refuses instead of guessing. The answer is not `list()` filtered: without a caller, `list()` reports only unowned jobs, so it cannot substitute for this proof. The call never cancels, removes, or advances a job, and it neither needs nor accepts a caller session: it reports only a boolean, so it grants no job access.
+
+An idle answer is valid only for the registry generation that produced it. A new registry instance (a service reload) begins a new generation with no knowledge of work a previous generation may have left behind; a provider that must stay safe across Jobs, registry, or policy reloads needs its own process-wide activation guarantee and must not treat a new generation's `true` as proof that the previous generation's resources are gone.
+
 ### Smallest working composition
 
 ```yaml

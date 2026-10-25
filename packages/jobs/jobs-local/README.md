@@ -56,7 +56,17 @@ The limit counts the exact owner's `running` and `stopping` records; all unowned
 
 Jobs belong to their owner and backend, not to the producer tool, so producer or controller reloads do not stop them. When an agent that owns jobs is disposed, its jobs are cancelled, their producers awaited, and their snapshots removed; service disposal does the same for every remaining job. A cancellation that throws during teardown force-fails the record and warns that the work may be orphaned, so teardown never deadlocks.
 
-Every owned record also holds an exact-owner usage lease from before the producer's `run()` until the record is removed. Running, stopping, and settled-but-unread records stay pinned, so idle reclamation never observes the owner as idle or cancels a background job; a sealed or retired owner rejects the start before the producer runs. Unowned work takes no lease, and a failed start releases its lease.
+Every owned record also holds an exact-owner usage lease from before the producer's `run()` until the record is removed. While the exact Agent remains in the agent registry, running, stopping, and settled-but-unread records stay pinned, so ordinary owner-level idle reclamation never observes that owner as idle or cancels a background job; a sealed or retired owner rejects the start before the producer runs. Unowned work takes no lease, and a failed start releases its lease. A detached Agent lifecycle discards its lease accounting with the entry, so the lease alone is not a process-wide readiness proof; use `isProcessIdle()` before reclaiming the process.
+
+### Idle readiness
+
+`isProcessIdle()` is this provider's synchronous readiness proof for a caller that may reclaim the process. It returns `true` only when every record in the registry — every owner and the shared unowned bucket — is absent or terminal, no public `start()` is between its entry and return (so a producer or listener re-entering during `run()` cannot observe idle before its record is published), service teardown has not begun, and no settlement has ever lacked the producer's confirmation.
+
+`false` covers both busy and unknown. A rejected `done` promise or a teardown cancel that throws latches the unknown; record removal, whether from owner disposal or an explicit removal, does not clear it. Once this generation sees an unconfirmed producer cleanup, it refuses idle for the rest of its life. The method only reads state: it never cancels, removes, or writes a job, and it takes no caller session, so it widens no job access.
+
+A throw from producer startup or post-start hook/source setup also latches `isProcessIdle()` false for this generation, even without a published record. Validation failure before the starter runs does not latch it. The original start error and lease-release behavior are preserved.
+
+The answer is specific to this registry instance. It proves nothing about a previous or a later generation: the disposed service's old instance refuses idle forever, while a fresh instance starts with no knowledge of the old one's outstanding work. A provider that must remain safe across Jobs, registry, or policy reloads needs its own process-once activation rather than treating a new generation's `true` as proof.
 
 ### Session timing records
 

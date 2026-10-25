@@ -193,6 +193,27 @@ export abstract class JobRegistry extends Service {
    * @returns disposer that detaches this controller.
    */
   abstract attachController(name: string): () => void
+
+  /**
+   * Whether this registry can synchronously prove that no local producer work
+   * remains, as a precondition for reclaiming the process. The default refuses:
+   * an implementation that cannot prove idleness returns `false`, so a caller
+   * never treats an unsupported registry as idle.
+   *
+   * A `true` answer must account for every owner and the shared unowned bucket
+   * for this registry generation, including work whose `start()` has not
+   * committed its record yet. An implementation returning `true` must also have
+   * no record running or stopping, no begun teardown, and no producer
+   * settlement whose resource release was unconfirmed. The call is read-only
+   * and process-wide: it neither accepts a caller session nor exposes jobs, and
+   * it never cancels, removes, or advances work. A registry generation cannot
+   * prove anything about a previous or later generation; a provider relying on
+   * idleness across reloads owns that process-wide guarantee itself.
+   * @returns whether no local producer work or unknown cleanup remains.
+   */
+  isProcessIdle(): boolean {
+    return false
+  }
 }
 
 export default JobRegistry

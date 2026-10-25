@@ -185,6 +185,9 @@ export class LocalJobRegistry extends JobRegistry {
   private ownerCleanups = new Map<Agent, () => Promise<void> | void>()
   /** Service context used by detached settlement continuations and teardown. */
   private readonly selfCtx: Context
+  private pendingStarts = 0
+  private closing = false
+  private unknownProducerCleanup = false
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
@@ -211,6 +214,15 @@ export class LocalJobRegistry extends JobRegistry {
   }
 
   start(spec: JobSpec): JobId {
+    this.pendingStarts += 1
+    try {
+      return this.startJob(spec)
+    } finally {
+      this.pendingStarts -= 1
+    }
+  }
+
+  private startJob(spec: JobSpec): JobId {
     const owner = this.resolveOwner(spec.owner)
     if (!this.servesOwner(owner)) {
       throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)')
@@ -256,82 +268,98 @@ export class LocalJobRegistry extends JobRegistry {
       append: (text, options) => { this.appendRing(state, ring, text, options, 'producer') },
       updateProgress: (line) => { this.updateProgress(state, line) },
     }
-    let hooks: ReturnType<JobSpec['run']>
+    // Once the starter runs, an exception escaping record setup may leave
+    // producer work with no settlement path; latch that unknown permanently.
+    let committed = false
     try {
-      hooks = spec.run(handle)
+      const hooks = spec.run(handle)
+      // Every binding from the starter's hooks belongs to the setup phase:
+      // a throwing cancel or done access here must release the lease instead
+      // of leaving the owner pinned by an unpublished record.
+      const cancel = hooks.cancel.bind(hooks)
+      const done = hooks.done
+      let markSettled!: () => void
+      const settled = new Promise<void>((resolve) => { markSettled = resolve })
+      const job: TrackedJob = {
+        id,
+        toolCall,
+        kind: spec.kind,
+        label: spec.label,
+        outputLimitBytes: spec.outputLimitBytes,
+        owner,
+        lease,
+        cancel,
+        status: 'running',
+        ring,
+        modelCursor: 0,
+        resultDelivered: false,
+        state,
+        detail: undefined,
+        result: undefined,
+        startedAt: Date.now(),
+        finishedAt: undefined,
+        killReason: undefined,
+        settleCause: undefined,
+        settled,
+        markSettled,
+        waitResolvers: new Set(),
+        pump: undefined,
+        spillPaths: [],
+      }
+      // Attach settlement and read every source getter before the commit: a
+      // throwing `done.then` or source accessor must not publish a record that
+      // no producer outcome can settle.
+      const producerDone = done.then(
+        outcome => ({ outcome, producerReported: true }),
+        (error: unknown): { outcome: JobOutcome; producerReported: boolean } => {
+          // Contain a producer contract violation (`done` rejected) so cleanup and waiters cannot hang.
+          this.selfCtx.logger.warn(`jobs: job ${job.id} producer done promise rejected (producer contract violation): ${String(error)}`)
+          return { outcome: { status: 'failed', detail: String(error) }, producerReported: false }
+        },
+      )
+      const sources = spec.output === undefined
+        ? []
+        : spec.output.map(source => this.guardSource(job, source))
+      // Binding the shared producer state is the commit: writes staged inside
+      // the starter are already in the ring and `state`, and every later handle
+      // call reaches the registered record for its terminal checks and signals.
+      state.job = job
+      this.store.set(id, job)
+      committed = true
+      this.recordSessionEvent(job)
+      // Registration is complete and cannot fail from here, so the visible set
+      // has genuinely changed. The announcement precedes the pump because the
+      // pump drains its sources once synchronously, and that drain may append
+      // and announce output: a job's first event is always `registered`.
+      this.emit({ type: 'registered', job: this.view(job) }, owner)
+      void producerDone.then(async ({ outcome, producerReported }) => {
+        if (job.pump !== undefined) await job.pump.done
+        this.settle(job, outcome, job.settleCause ?? 'producer', producerReported)
+      })
+      if (sources.length > 0) {
+        job.pump = startPump(
+          sources,
+          {
+            append: (text, options) => { this.appendRing(state, ring, text, options, 'pump') },
+            spill: (index, path) => { job.spillPaths[index] = path },
+          },
+          this.pumpPollMs,
+          Promise.race([producerDone, settled]),
+        )
+      }
+      return id
     } catch (error: unknown) {
-      // A producer that fails synchronously never commits a record, so its
-      // owner lease must not outlive the failed start.
-      lease?.release()
+      this.unknownProducerCleanup = true
+      if (!committed) {
+        try {
+          lease?.release()
+        } catch (releaseError: unknown) {
+          // The startup error stays primary; the latch above already refuses idle.
+          this.selfCtx.logger.warn(`jobs: failed to release the owner lease after an uncommitted start: ${String(releaseError)}`)
+        }
+      }
       throw error
     }
-
-    let markSettled!: () => void
-    const settled = new Promise<void>((resolve) => { markSettled = resolve })
-    const job: TrackedJob = {
-      id,
-      toolCall,
-      kind: spec.kind,
-      label: spec.label,
-      outputLimitBytes: spec.outputLimitBytes,
-      owner,
-      lease,
-      cancel: hooks.cancel.bind(hooks),
-      status: 'running',
-      ring,
-      modelCursor: 0,
-      resultDelivered: false,
-      state,
-      detail: undefined,
-      result: undefined,
-      startedAt: Date.now(),
-      finishedAt: undefined,
-      killReason: undefined,
-      settleCause: undefined,
-      settled,
-      markSettled,
-      waitResolvers: new Set(),
-      pump: undefined,
-      spillPaths: [],
-    }
-    // Binding the shared producer state is the commit: writes staged inside
-    // the starter are already in the ring and `state`, and every later handle
-    // call reaches the registered record for its terminal checks and signals.
-    state.job = job
-    this.store.set(id, job)
-    this.recordSessionEvent(job)
-    // Registration is complete and cannot fail from here, so the visible set
-    // has genuinely changed. The announcement precedes the pump because the
-    // pump drains its sources once synchronously, and that drain may append
-    // and announce output: a job's first event is always `registered`.
-    this.emit({ type: 'registered', job: this.view(job) }, owner)
-
-    // The producer's settlement or a registry-forced one ends the pump; the
-    // pump's final drain then lands before this registry trims the ring.
-    const producerDone = hooks.done.then(
-      outcome => ({ outcome, producerReported: true }),
-      (error: unknown): { outcome: JobOutcome; producerReported: boolean } => {
-        // Contain a producer contract violation (`done` rejected) so cleanup and waiters cannot hang.
-        this.selfCtx.logger.warn(`jobs: job ${job.id} producer done promise rejected (producer contract violation): ${String(error)}`)
-        return { outcome: { status: 'failed', detail: String(error) }, producerReported: false }
-      },
-    )
-    if (spec.output !== undefined && spec.output.length > 0) {
-      job.pump = startPump(
-        spec.output.map(source => this.guardSource(job, source)),
-        {
-          append: (text, options) => { this.appendRing(state, ring, text, options, 'pump') },
-          spill: (index, path) => { job.spillPaths[index] = path },
-        },
-        this.pumpPollMs,
-        Promise.race([producerDone, settled]),
-      )
-    }
-    void producerDone.then(async ({ outcome, producerReported }) => {
-      if (job.pump !== undefined) await job.pump.done
-      this.settle(job, outcome, job.settleCause ?? 'producer', producerReported)
-    })
-    return id
   }
 
   list(caller?: SessionId): JobView[] {
@@ -378,6 +406,14 @@ export class LocalJobRegistry extends JobRegistry {
       layer => layer.controllers.append(token),
       { label: 'jobs.attachController()' },
     )
+  }
+
+  override isProcessIdle(): boolean {
+    if (this.closing || this.pendingStarts !== 0 || this.unknownProducerCleanup) return false
+    for (const job of this.store.values()) {
+      if (job.status === 'running' || job.status === 'stopping') return false
+    }
+    return true
   }
 
   /**
@@ -644,6 +680,10 @@ export class LocalJobRegistry extends JobRegistry {
    * left the set, so only a wait still owed the projection counts.
    */
   private settle(job: TrackedJob, outcome: JobOutcome, cause: JobSettleCause, producerReported: boolean): void {
+    // An unconfirmed cleanup is unknown even if the first-wins check below
+    // drops this terminal outcome. Latch before the early return so a late
+    // report or the record's removal cannot erase the unknown.
+    if (!producerReported) this.unknownProducerCleanup = true
     if (isTerminal(job.status)) return
     job.status = outcome.status
     // A killed settlement carries the recorded kill reason in its detail:
@@ -717,6 +757,9 @@ export class LocalJobRegistry extends JobRegistry {
    * effects. Throwing cancels are force-failed to avoid teardown deadlock.
    */
   private async disposeAll(): Promise<void> {
+    // Teardown is irreversible for this generation: mark it before the first
+    // await so cancellation and removal cannot briefly read as idle.
+    this.closing = true
     const all = [...this.store.values()]
     this.cancelForTeardown(all, 'jobs service disposed')
     await Promise.all(all.map(job => job.settled))
