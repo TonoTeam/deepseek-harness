@@ -1,3 +1,4 @@
+import { generateKeyPairSync, verify } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { AttachmentId, AttachmentStore, ImageVariantId } from '@deepseek-ai/dsh-attachment'
@@ -10,6 +11,8 @@ import type {
   StoredImageAttachment,
 } from '@deepseek-ai/dsh-attachment'
 import LlmRuntime, { createToolResultMessage, createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, ReasoningEffortId, userAgent } from '@deepseek-ai/dsh-llm'
+import { clearModelRequestScope, setModelRequestScope } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
@@ -88,6 +91,39 @@ describe('PiAiAdapter provider routing', () => {
     expect(result.finish).toEqual({ kind: 'stop' })
     expect(result.usage).toEqual({ inputTokens: 3, outputTokens: 1, totalTokens: 4 })
     expect(server.paths).toEqual(['/chat/completions'])
+  })
+
+  it('signs each scoped session on the local wire and leaves other sessions untouched', async () => {
+    const server = await mockServer(Array.from({ length: 3 }, () => ({ events: textEvents })))
+    const ctx = await harness(server.url + '/resident')
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519')
+    const signingKey = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64')
+    const scope = {
+      requestId: 'run-1', signingKey, provider: 'deepseek', model: 'deepseek-flash',
+      maxOutputTokens: 131072, contextWindowTokens: 1048576,
+    }
+    setModelRequestScope('scoped-root', scope)
+    setModelRequestScope('scoped-child', scope)
+    onTestFinished(() => {
+      clearModelRequestScope('scoped-root')
+      clearModelRequestScope('scoped-child')
+    })
+    for (const id of ['scoped-root', 'scoped-child', 'ordinary']) {
+      const result = await assemble(ctx, {
+        model: scope.model, messages: [], sessionId: id as NonNullable<GenerateOptions['sessionId']>,
+        ...id === 'scoped-child' ? { purpose: 'compaction' } : {},
+      })
+      expect(result.finish).toEqual({ kind: 'stop' })
+    }
+    expect(server.paths).toEqual(Array.from({ length: 3 }, () => '/resident/chat/completions'))
+    for (const [index, id] of ['scoped-root', 'scoped-child'].entries()) {
+      const headers = server.headers[index]
+      expect(headers?.['x-deepseek-harness-session-id']).toBe(id)
+      const [run, signature] = String(headers?.['x-tono-model-run']).split('.')
+      expect(run).toBe('run-1')
+      expect(verify(null, Buffer.from('run-1\n' + id), publicKey, Buffer.from(signature ?? '', 'base64url'))).toBe(true)
+    }
+    expect(server.headers[2]?.['x-tono-model-run']).toBeUndefined()
   })
 
   it('keeps prepared model metadata and dispatch on one profile snapshot', async () => {

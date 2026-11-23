@@ -23,6 +23,7 @@ import {
   createDeveloperMessage,
   errorChain,
   markAgentLoopRequest,
+  modelRequestScope,
 } from '@deepseek-ai/dsh-llm'
 import { assertNever, deepFreeze } from '@deepseek-ai/dsh-util-values'
 import type { Scope } from '@deepseek-ai/dsh-scope'
@@ -590,11 +591,15 @@ export class ReactLoopAgent implements Agent {
           ...maxTokens === undefined ? {} : { maxTokens },
         },
     ))
-    const proposedConfig = await this.dispatch.waterfall(
+    const configured = await this.dispatch.waterfall(
       'agent/request', { turn, step, signal },
       () => Promise.resolve(seedConfig),
     )
     signal.throwIfAborted()
+    const modelScope = modelRequestScope(session.id)
+    const proposedConfig = modelScope === undefined ? configured : {
+      ...configured, provider: modelScope.provider, model: modelScope.model, maxTokens: modelScope.maxOutputTokens,
+    }
     if (!proposedConfig.provider || !proposedConfig.model) {
       throw new Error(`agent "${this.id}" has no provider/model: set AgentOptions.provider and AgentOptions.model or supply both via the agent/request waterfall`)
     }

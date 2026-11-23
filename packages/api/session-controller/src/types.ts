@@ -6,7 +6,7 @@ import type {
 } from '@deepseek-ai/dsh-attachment'
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { LlmAttemptId, MessageId } from '@deepseek-ai/dsh-llm/brand'
-import type { TextBlock } from '@deepseek-ai/dsh-llm'
+import type { ModelRequestContext, TextBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId, SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
 import type { SessionProjectionMap } from '@deepseek-ai/dsh-session-projection/types'
 import type { Principal } from '@deepseek-ai/dsh-typert-protocol'
@@ -307,6 +307,15 @@ export interface SessionCreateValue {
 /** Session model-selection request. */
 export interface SessionSelectModelRequest extends ModelSelection {
   readonly sessionId: SessionId
+}
+
+/** Session-only selection and optional authorization for the next identified prompt. */
+export interface SessionScopedModelRequest extends SessionSelectModelRequest {
+  readonly requestContext?: ModelRequestContext
+}
+
+export interface SessionScopedModelValue extends SessionSelectModelValue {
+  readonly requestId?: string
 }
 
 /** Accepted model selection after Host resolution. */

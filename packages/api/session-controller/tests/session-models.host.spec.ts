@@ -5,12 +5,13 @@
  * boundary for a running selection change.
  */
 
+import { generateKeyPairSync } from 'node:crypto'
 import { describe, expect, it, vi, onTestFinished } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AttachmentStore from '@deepseek-ai/dsh-attachment'
-import LlmRuntime, { LlmAdapter, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { LlmAdapter, ReasoningEffortId, modelRequestScope } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmCallConfig, LlmCallConfigAdapterDefaults, LlmModelInfo,
   LlmModelReasoningInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
@@ -615,6 +616,32 @@ describe('Web session model selection', () => {
     expect(new ApiSessionAgentController(ctx).selectionFor(agent).current)
       .toEqual({ provider: 'deepseek-official', model: 'deepseek-chat' })
     await ctx.fiber.dispose()
+  })
+
+  it('installs a request model for one idle Session without writing the Host default', async () => {
+    const { ctx, agent, sessionId } = await harness()
+    Object.defineProperty(agent, 'status', { value: 'idle' })
+    const saveDefaultModelSelection = vi.fn(async () => {})
+    const defaultModel = { provider: 'deepseek-official', model: 'deepseek-chat' }
+    const controller = createSessionTestController(ctx, {
+      defaultModelSelection: () => defaultModel, saveDefaultModelSelection, cwd: '/tmp',
+    })
+    const { privateKey } = generateKeyPairSync('ed25519')
+    const requestContext = {
+      requestId: 'run-test', signingKey: privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64'),
+      maxOutputTokens: 131072, contextWindowTokens: 1048576,
+    }
+    onTestFinished(async () => {
+      await ctx.fiber.dispose()
+    })
+
+    expect(await controller.selectModelForSession({
+      sessionId, provider: defaultModel.provider, model: 'deepseek-reasoner', requestContext,
+    })).toMatchObject({ requestId: 'run-test', selected: { model: 'deepseek-reasoner' } })
+    expect(modelRequestScope(sessionId)).toMatchObject({ requestId: 'run-test', maxOutputTokens: 131072 })
+    expect(currentSelection(ctx, sessionId)).toMatchObject({ model: 'deepseek-reasoner' })
+    expect(ctx.agentDefaultModel.currentSelection()).toEqual(defaultModel)
+    expect(saveDefaultModelSelection).not.toHaveBeenCalled()
   })
 
   it('accepts consecutive model switches while default persistence is blocked', async () => {

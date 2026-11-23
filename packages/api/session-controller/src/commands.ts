@@ -13,6 +13,7 @@ import type { FileUploadReceiptId } from '@deepseek-ai/dsh-client-file-upload/ty
 import type {} from '@deepseek-ai/dsh-client-file-upload'
 import {
   ReasoningEffortId, assistantStreamChunks, createUserMessage, freezeMessage,
+  clearModelRequestScope, modelRequestScope, setModelRequestScope,
 } from '@deepseek-ai/dsh-llm'
 import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
@@ -49,6 +50,8 @@ import type {
   SessionRenameValue,
   SessionSelectModelRequest,
   SessionSelectModelValue,
+  SessionScopedModelRequest,
+  SessionScopedModelValue,
   SessionUpdateQueueRequest,
   SessionUpdateQueueValue,
   SessionRequestId,
@@ -91,6 +94,8 @@ function latestCompletedPrefixBoundary(events: readonly SessionEvent[]): Session
 
 /** Implements Session business commands delegated by the Session Controller Remote service. */
 export class SessionCommandController {
+  private readonly scopedAgents = new WeakSet<Agent>()
+
   /**
    * @param ctx - Host context carrying Agent, model, attachment, title, and Workspace services.
    * @param agents - sole owner of create, resume, and Session-local model selection.
@@ -155,6 +160,17 @@ export class SessionCommandController {
    * @returns the normalized selection installed for the Session, without waiting for default persistence.
    */
   async selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue> {
+    return this.installModel(request, true)
+  }
+
+  async selectModelForSession(request: SessionScopedModelRequest): Promise<SessionScopedModelValue> {
+    return this.installModel(request, false)
+  }
+
+  private async installModel(
+    request: SessionScopedModelRequest,
+    saveDefault: boolean,
+  ): Promise<SessionScopedModelValue> {
     const agent = await this.resolveAgent(request.sessionId)
     return this.agents.serializeImageAdmission(agent, async () => {
       try {
@@ -173,13 +189,35 @@ export class SessionCommandController {
             ? {}
             : { reasoningEffort: resolved.reasoningEffort }),
         }
+        const context = request.requestContext
+        if (context !== undefined && (
+          !/^[a-zA-Z0-9_-]{1,100}$/.test(context.requestId)
+          || !/^[A-Za-z0-9+/]{64}$/.test(context.signingKey)
+          || !Number.isSafeInteger(context.maxOutputTokens) || context.maxOutputTokens < 1
+          || !Number.isSafeInteger(context.contextWindowTokens)
+          || context.contextWindowTokens <= context.maxOutputTokens
+          || agent.status !== 'idle' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length
+        )) {
+          throw new RemoteError('session/model-unavailable', 'Cannot bind a model to this request.', {
+            provider: request.provider, model: request.model,
+          })
+        }
         this.agents.selectForNextRequest(agent, selected)
-        void this.ctx.agentDefaultModel.saveSelection(selected).catch((error: unknown) => {
-          this.ctx.logger.warn(
-            `session-controller: model selection changed for the Session but the default was not saved: ${String(error)}`,
-          )
-        })
-        return { selected: { ...selected } }
+        if (context !== undefined) {
+          setModelRequestScope(agent.id, { ...context, provider: selected.provider, model: selected.model })
+          if (!this.scopedAgents.has(agent)) {
+            this.scopedAgents.add(agent)
+            agent.ctx.effect(() => () => { clearModelRequestScope(agent.id) })
+          }
+        }
+        if (saveDefault) {
+          void this.ctx.agentDefaultModel.saveSelection(selected).catch((error: unknown) => {
+            this.ctx.logger.warn(
+              `session-controller: model selection changed for the Session but the default was not saved: ${String(error)}`,
+            )
+          })
+        }
+        return { selected: { ...selected }, ...context === undefined ? {} : { requestId: context.requestId } }
       } catch (error) {
         if (remoteErrorOf(error) !== undefined) throw error
         throw new RemoteError(
@@ -345,6 +383,12 @@ export class SessionCommandController {
             `session "${agent.id}" was disposed during prompt admission`,
             { sessionId: agent.id },
           )
+        }
+        const modelScope = modelRequestScope(agent.id)
+        if (modelScope !== undefined && agent.status === 'idle' && request.requestId !== modelScope.requestId) {
+          throw new RemoteError('session/model-unavailable', 'No model binding for this request.', {
+            provider: modelScope.provider, model: modelScope.model,
+          })
         }
         using binding = this.ctx.fileUploads.bindPrompt(agent, admission.receiptIds, request.requestId)
         if (request.mode === 'steer') agent.steer(message)

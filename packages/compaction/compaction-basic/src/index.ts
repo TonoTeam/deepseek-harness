@@ -9,7 +9,7 @@ import z from '@deepseek-ai/schemastery'
 import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
-import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, modelRequestScope } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
@@ -71,7 +71,7 @@ function reservedCompletionTokens(agent: Agent, defaultMaxTokens: number | undef
 function conversationTarget(
   agent: Agent,
 ): Pick<LlmCallConfig, 'provider' | 'model'> | undefined {
-  const routed = routedTarget(agent.session)
+  const routed = modelRequestScope(agent.id) ?? routedTarget(agent.session)
   if (routed !== undefined) return routed
   if (agent.options.provider === undefined || agent.options.provider.length === 0
     || agent.options.model === undefined || agent.options.model.length === 0) return undefined
@@ -271,7 +271,8 @@ export class BasicCompactionEngine extends CompactionEngine {
     trigger: CompactionTrigger,
     signal: AbortSignal,
   ): Promise<CompactionResult | null> {
-    const target = routedTarget(agent.session)
+    const scope = modelRequestScope(agent.id)
+    const target = scope ?? routedTarget(agent.session)
     if (target === undefined) return null
     const policy = resolveTargetPolicy(this.config, target)
     const meter = this.ctx.tokenMeter
@@ -313,8 +314,8 @@ export class BasicCompactionEngine extends CompactionEngine {
     }
     const spec = resolveCompactSpec(
       policy,
-      info.context.contextWindow,
-      reservedCompletionTokens(agent, info.defaultMaxTokens),
+      scope?.contextWindowTokens ?? info.context.contextWindow,
+      scope?.maxOutputTokens ?? reservedCompletionTokens(agent, info.defaultMaxTokens),
     )
     if (measurement.totalTokens < spec.thresholdTokens) return null
 
