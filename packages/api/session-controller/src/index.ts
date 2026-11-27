@@ -63,6 +63,8 @@ import type {
   SessionSearchValue,
   SessionSelectModelRequest,
   SessionSelectModelValue,
+  SessionScopedModelRequest,
+  SessionScopedModelValue,
   SessionProjectionsRequest,
   SessionProjectionsValue,
   SessionProjectionValues,
@@ -312,6 +314,16 @@ export class SessionController extends TypertRemoteService {
   @Remote('selectModel')
   selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue> {
     return this.commands.selectModel(request)
+  }
+
+  /**
+   * Select this Session's model without saving it as the Host default.
+   * @param request - Session identity, model, and optional request binding and limits.
+   * @returns the installed Session model and request ID when a binding was supplied.
+   */
+  @Remote('selectModelForSession')
+  selectModelForSession(request: SessionScopedModelRequest): Promise<SessionScopedModelValue> {
+    return this.commands.selectModelForSession(request)
   }
 
   /**

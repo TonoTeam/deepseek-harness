@@ -2095,6 +2095,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the normalized selection installed for the Session, without waiting for default persistence.',
       },
       {
+        signature: '@Remote(\'selectModelForSession\') selectModelForSession(request: SessionScopedModelRequest): Promise<SessionScopedModelValue>',
+        description: 'Select this Session\'s model without saving it as the Host default.',
+        parameters: [{ name: 'request', description: 'Session identity, model, and optional request binding and limits.' }],
+        returns: 'the installed Session model and request ID when a binding was supplied.',
+      },
+      {
         signature: '@Remote async initializeDefaultModel(): Promise<void>',
         description: 'Select the first available account model after login when no provider API key is configured.',
         parameters: [],
@@ -6260,6 +6266,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface ModelReasoningEffort {\n    readonly id: string;\n    readonly name: string;\n    readonly description?: string;\n}',
   },
   {
+    name: 'ModelRequestContext',
+    declaration: 'export interface ModelRequestContext {\n    readonly requestId: string;\n    readonly signingKey: string;\n    readonly maxOutputTokens: number;\n    readonly contextWindowTokens: number;\n}',
+  },
+  {
     name: 'ModEvents',
     declaration: 'export interface ModEvents {\n    \'session.start\': {\n        input: SessionStartInput;\n        result: SessionStartResult;\n    };\n    \'session.end\': {\n        input: SessionEndInput;\n        result: SessionEndResult;\n    };\n    \'prompt.submit\': {\n        input: PromptSubmitInput;\n        result: PromptSubmitResult;\n    };\n    \'turn.start\': {\n        input: TurnStartInput;\n        result: TurnStartResult;\n    };\n    \'turn.complete\': {\n        input: TurnCompleteInput;\n        result: TurnCompleteResult;\n    };\n    \'tool.call\': {\n        input: ToolCallInput;\n        result: ToolCallResult;\n    };\n    \'command.run\': {\n        input: CommandRunInput;\n        result: CommandRunResult;\n    };\n    \'ui.render\': {\n        input: UiRenderInput;\n        result: UiRenderResult;\n    };\n}',
   },
@@ -7414,6 +7424,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionResultRange',
     declaration: 'export interface SessionResultRange {\n    from?: number;\n    to?: number;\n}',
+  },
+  {
+    name: 'SessionScopedModelRequest',
+    declaration: 'export interface SessionScopedModelRequest extends SessionSelectModelRequest {\n    readonly requestContext?: ModelRequestContext;\n}',
+  },
+  {
+    name: 'SessionScopedModelValue',
+    declaration: 'export interface SessionScopedModelValue extends SessionSelectModelValue {\n    readonly requestId?: string;\n}',
   },
   {
     name: 'SessionSearchCursor',

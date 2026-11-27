@@ -92,6 +92,8 @@ GUI model selection requires the exact provider/model pair in the available cata
 
 A successful `selectModel` response acknowledges the Session-local selection without waiting for the default profile setting to save. Default saves run in the background in submission order; a failure logs a warning and leaves the Session selection intact. New Sessions read the last successfully saved default.
 
+`selectModelForSession` applies a selection to the Session only. A controller can attach an optional request context for the next prompt with the matching request ID. The context binds the model and request budget for that prompt and its in-process delegates. Its signing key stays in live memory.
+
 -----
 
 <a id="configuration"></a>

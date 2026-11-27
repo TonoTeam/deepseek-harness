@@ -12,7 +12,10 @@ import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { ReasoningEffortId, contentHasImage, createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import {
+  ReasoningEffortId, clearModelRequestScope, contentHasImage, createUserMessage, errorChain, modelRequestScope,
+  setModelRequestScope,
+} from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
 import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionId, SessionEvent, UserMessage } from '@deepseek-ai/dsh-session'
@@ -858,7 +861,11 @@ export class SubagentManager {
     let childId = inputs.childId
     inputs.signal.throwIfAborted()
     let resource: ActivationResource
+    const modelScope = modelRequestScope(parent.id)
     if (inputs.kind === 'external') {
+      if (modelScope !== undefined) {
+        throw new SubagentError('Request-scoped models require an in-process subagent.', 'UNAUTHORIZED')
+      }
       const controller = new AbortController()
       const cancelStartup = (): void => { controller.abort(inputs.signal.reason) }
       inputs.signal.addEventListener('abort', cancelStartup, { once: true })
@@ -878,6 +885,10 @@ export class SubagentManager {
       const { create } = inputs
       let structured: StructuredAttachment | undefined
       const setup = async (childCtx: Context, child: Agent): Promise<void> => {
+        if (modelScope !== undefined) {
+          setModelRequestScope(child.id, modelScope)
+        }
+        childCtx.effect(() => () => { clearModelRequestScope(child.id) })
         // Only fresh creation appends the descriptor and delegated policy after
         // the inherited marker; a cold resume replays those persisted events.
         if (inputs.composition.agentPreset !== undefined) {
@@ -1427,6 +1438,17 @@ export class SubagentManager {
     options.signal.throwIfAborted()
     this.assertAdmitting(parent)
     this.authorizeLineage(parent, activation.childId, activation.parent.id)
+    const parentScope = modelRequestScope(parent.id)
+    if (parentScope !== undefined && activation.kind === 'local') {
+      const child = activation.handle.agent
+      const childScope = modelRequestScope(child.id)
+      if (childScope?.signingKey !== parentScope.signingKey) {
+        if (child.status !== 'idle') {
+          throw new SubagentError('Child is still bound to another request.', 'UNAUTHORIZED')
+        }
+        setModelRequestScope(child.id, parentScope)
+      }
+    }
     this.acquireOwnership(parent, activation.childId)
     try {
       this.deliver(activation, message, options.delivery)

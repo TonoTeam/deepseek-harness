@@ -26,6 +26,8 @@
  * @module dsh-llm-pi-ai/adapter
  */
 
+import { createPrivateKey, sign } from 'node:crypto'
+
 import type {
   Api,
   AuthContext,
@@ -42,6 +44,7 @@ import {
   contentHasImage,
   LlmAdapter,
   LlmError,
+  modelRequestScope,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import type {
@@ -413,6 +416,21 @@ export class PiAiAdapter extends LlmAdapter {
             maxBytes: profile.requestImageMaxBytes,
           },
         }, onReplayDegrade)
+      const scope = modelRequestScope(options.sessionId)
+      if (scope !== undefined && (scope.provider !== options.provider || scope.model !== options.model)) {
+        throw new LlmError('Model route differs from the admitted request.', 'INVALID_CONFIG')
+      }
+      const headers = requestHeaders(profile.headers)
+      if (scope !== undefined && options.sessionId !== undefined) {
+        const endpoint = new URL(model.baseUrl)
+        if (endpoint.protocol !== 'http:' || endpoint.hostname !== '127.0.0.1') {
+          throw new LlmError('Request-scoped model authorization requires a loopback proxy.', 'INVALID_CONFIG')
+        }
+        headers['x-deepseek-harness-session-id'] = String(options.sessionId)
+        const key = createPrivateKey({ key: Buffer.from(scope.signingKey, 'base64'), format: 'der', type: 'pkcs8' })
+        const signature = sign(null, Buffer.from(scope.requestId + '\n' + options.sessionId), key)
+        headers['x-tono-model-run'] = scope.requestId + '.' + signature.toString('base64url')
+      }
       const events = snapshot.models.streamSimple(model, context, {
         ...profileOptions(profile, reasoning, apiKey),
         ...options.temperature === undefined ? {} : { temperature: options.temperature },
@@ -421,9 +439,10 @@ export class PiAiAdapter extends LlmAdapter {
         signal: watchdog.signal,
         // Profile headers are deployment-owned; attribution names are
         // Harness-owned and therefore win collisions.
-        headers: requestHeaders(profile.headers),
+        headers,
       })
-      const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
+      const contextWindow = scope?.contextWindowTokens ?? model.contextWindow
+      const iterator = toStreamChunks(events, contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
       let exhausted = false
       try {
         while (true) {

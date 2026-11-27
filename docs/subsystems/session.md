@@ -872,6 +872,13 @@ inspect( sessionId: SessionId, signal?: AbortSignal, ): Promise<SessionInspectio
 @Remote('selectModel') selectModel(request: SessionSelectModelRequest): Promise<SessionSelectModelValue>
 
 /**
+ * Select this Session's model without saving it as the Host default.
+ * @param request - Session identity, model, and optional request binding and limits.
+ * @returns the installed Session model and request ID when a binding was supplied.
+ */
+@Remote('selectModelForSession') selectModelForSession(request: SessionScopedModelRequest): Promise<SessionScopedModelValue>
+
+/**
  * Select the first available account model after login when no provider API key is configured.
  * @returns after saving the first available model or retaining the existing default.
  */
