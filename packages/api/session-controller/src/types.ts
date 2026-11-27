@@ -314,6 +314,7 @@ export interface SessionScopedModelRequest extends SessionSelectModelRequest {
   readonly requestContext?: ModelRequestContext
 }
 
+/** Accepted Session model and the request identity when the selection is bound. */
 export interface SessionScopedModelValue extends SessionSelectModelValue {
   readonly requestId?: string
 }

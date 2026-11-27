@@ -163,6 +163,11 @@ export class SessionCommandController {
     return this.installModel(request, true)
   }
 
+  /**
+   * Install a Session-local selection and bind the next request when the caller supplies authorization.
+   * @param request - Session identity, model, and optional request binding and limits.
+   * @returns the installed selection and the request ID when bound.
+   */
   async selectModelForSession(request: SessionScopedModelRequest): Promise<SessionScopedModelValue> {
     return this.installModel(request, false)
   }
